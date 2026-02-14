@@ -1,2 +1,56 @@
+﻿# Python cache
 __pycache__/
 *.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+shejianplus/
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Test / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# IDE / editor
+.vscode/
+.idea/
+*.code-workspace
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs / temp
+*.log
+*.tmp
+*.temp
+
+# Local runtime data
+workspace/
+output/
+annotations/manual_annotations.json
+
+# Large model artifacts (keep via external storage/LFS if needed)
+*.onnx
+*.pth
+*.pt
+*.ckpt
+
+# Optional: large media
+*.avi
+*.mp4
