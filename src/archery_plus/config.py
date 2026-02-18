@@ -15,6 +15,7 @@ MODEL_FILES = {
 
 WEIGHT_FILES = {
     "archery_keypoints_pth": "rtmo-s_640-8x32-600e.pth",
+    "mmpose_rtmo_s_coco_pth": "rtmo-s_8xb32-600e_coco-640x640-8db55a59_20231211.pth",
     "human_halpe26_pth": "rtmpose-x_simcc-body7_pt-body7-halpe26_700e-384x288-7fb6e239_20230606.pth",
 }
 

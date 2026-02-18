@@ -8,8 +8,13 @@ from typing import Any
 
 import cv2
 
-from archery_plus.pipelines.auto_annotator_halpe26 import HALPE26_NAMES
-from archery_plus.pipelines.auto_annotator_rtmo_archery import ARCHERY_KEYPOINTS
+from archery_plus.core.keypoint_schema import (
+    TARGET_ARCHERY,
+    TARGET_HUMAN,
+    ensure_project_keypoint_sets,
+    get_active_keypoint_set,
+    normalize_target_name,
+)
 
 
 @dataclass(frozen=True)
@@ -41,8 +46,10 @@ def build_mmpose_coco_dataset(
     val_ratio: float = 0.1,
     test_ratio: float = 0.1,
     random_seed: int = 42,
-    human_category_name: str = "human",
-    archery_category_name: str = "archery",
+    human_category_name: str | None = None,
+    archery_category_name: str | None = None,
+    active_target: str = TARGET_HUMAN,
+    active_category_name: str = "",
     output_dir: Path | None = None,
 ) -> MMPoseDatasetBuildResult:
     ann_path = project_root / "annotations" / "manual_annotations.json"
@@ -54,6 +61,23 @@ def build_mmpose_coco_dataset(
 
     if not isinstance(raw, dict):
         raise RuntimeError("manual_annotations.json format invalid: root should be dict")
+
+    ensure_project_keypoint_sets(project_root)
+    human_set = get_active_keypoint_set(project_root, TARGET_HUMAN)
+    archery_set = get_active_keypoint_set(project_root, TARGET_ARCHERY)
+
+    active = normalize_target_name(active_target)
+    human_category = (human_category_name or "").strip() or human_set.set_name or "human"
+    archery_category = (archery_category_name or "").strip() or archery_set.set_name or "archery"
+    active_category = active_category_name.strip()
+    if active_category:
+        if active == TARGET_HUMAN:
+            human_category = active_category
+        else:
+            archery_category = active_category
+
+    human_names = human_set.names
+    archery_names = archery_set.names
 
     image_root = project_root / "images" / "cam1"
     records: list[dict[str, Any]] = []
@@ -87,8 +111,8 @@ def build_mmpose_coco_dataset(
                 "image_path": str(Path("images") / "cam1" / str(image_name)).replace("\\", "/"),
                 "width": int(width),
                 "height": int(height),
-                "human_keypoints": _order_points(human_points_raw, HALPE26_NAMES),
-                "archery_keypoints": _order_points(archery_points_raw, ARCHERY_KEYPOINTS),
+                "human_keypoints": _order_points(human_points_raw, human_names),
+                "archery_keypoints": _order_points(archery_points_raw, archery_names),
             }
         )
 
@@ -107,39 +131,39 @@ def build_mmpose_coco_dataset(
     human_train_json, human_train_count = _build_coco_split(
         train_records,
         key_field="human_keypoints",
-        keypoint_names=HALPE26_NAMES,
-        category_name=human_category_name,
+        keypoint_names=human_names,
+        category_name=human_category,
     )
     human_val_json, human_val_count = _build_coco_split(
         val_records,
         key_field="human_keypoints",
-        keypoint_names=HALPE26_NAMES,
-        category_name=human_category_name,
+        keypoint_names=human_names,
+        category_name=human_category,
     )
     human_test_json, human_test_count = _build_coco_split(
         test_records,
         key_field="human_keypoints",
-        keypoint_names=HALPE26_NAMES,
-        category_name=human_category_name,
+        keypoint_names=human_names,
+        category_name=human_category,
     )
 
     archery_train_json, archery_train_count = _build_coco_split(
         train_records,
         key_field="archery_keypoints",
-        keypoint_names=ARCHERY_KEYPOINTS,
-        category_name=archery_category_name,
+        keypoint_names=archery_names,
+        category_name=archery_category,
     )
     archery_val_json, archery_val_count = _build_coco_split(
         val_records,
         key_field="archery_keypoints",
-        keypoint_names=ARCHERY_KEYPOINTS,
-        category_name=archery_category_name,
+        keypoint_names=archery_names,
+        category_name=archery_category,
     )
     archery_test_json, archery_test_count = _build_coco_split(
         test_records,
         key_field="archery_keypoints",
-        keypoint_names=ARCHERY_KEYPOINTS,
-        category_name=archery_category_name,
+        keypoint_names=archery_names,
+        category_name=archery_category,
     )
 
     human_paths = SplitAnnotationPaths(
@@ -173,8 +197,9 @@ def build_mmpose_coco_dataset(
         },
         "categories": {
             "human": {
-                "name": human_category_name,
-                "keypoints": HALPE26_NAMES,
+                "name": human_category,
+                "set_name": human_set.set_name,
+                "keypoints": human_names,
                 "annotation_files": {
                     "train": str(human_paths.train),
                     "val": str(human_paths.val),
@@ -187,8 +212,9 @@ def build_mmpose_coco_dataset(
                 },
             },
             "archery": {
-                "name": archery_category_name,
-                "keypoints": ARCHERY_KEYPOINTS,
+                "name": archery_category,
+                "set_name": archery_set.set_name,
+                "keypoints": archery_names,
                 "annotation_files": {
                     "train": str(archery_paths.train),
                     "val": str(archery_paths.val),
@@ -201,6 +227,7 @@ def build_mmpose_coco_dataset(
                 },
             },
         },
+        "active_target": active,
         "random_seed": random_seed,
         "ratios": {
             "train": float(train_ratio),
@@ -435,7 +462,3 @@ def _order_points(raw_points: object, names_order: list[str]) -> list[dict[str, 
         )
 
     return ordered
-
-
-
-

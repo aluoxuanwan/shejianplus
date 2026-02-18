@@ -7,7 +7,9 @@ import cv2
 import numpy as np
 import onnxruntime as ort
 
-ARCHERY_KEYPOINTS = ["UP", "DOWN", "FL", "ST", "FS"]
+from archery_plus.core.keypoint_schema import DEFAULT_ARCHERY_KEYPOINT_NAMES
+
+ARCHERY_KEYPOINTS = list(DEFAULT_ARCHERY_KEYPOINT_NAMES)
 
 
 @dataclass
@@ -22,11 +24,11 @@ class RtmoArcheryAutoAnnotator:
         self,
         model_path: Path,
         confidence_threshold: float = 0.3,
-        nms_threshold: float = 0.5,
+        iou_threshold: float = 0.5,
     ) -> None:
         self.model_path = model_path
         self.confidence_threshold = float(confidence_threshold)
-        self.nms_threshold = float(nms_threshold)
+        self.iou_threshold = float(iou_threshold)
         self._session: ort.InferenceSession | None = None
         self._input_name: str | None = None
         self._input_hw: tuple[int, int] | None = None
@@ -38,9 +40,9 @@ class RtmoArcheryAutoAnnotator:
         except Exception:
             return False
 
-    def set_thresholds(self, confidence_threshold: float, nms_threshold: float) -> None:
+    def set_thresholds(self, confidence_threshold: float, iou_threshold: float) -> None:
         self.confidence_threshold = float(confidence_threshold)
-        self.nms_threshold = float(nms_threshold)
+        self.iou_threshold = float(iou_threshold)
 
     def predict_image(self, image_path: Path) -> ArcheryAutoAnnotateResult:
         image_bgr = cv2.imread(str(image_path))
@@ -64,7 +66,7 @@ class RtmoArcheryAutoAnnotator:
         if boxes.shape[0] == 0:
             return ArcheryAutoAnnotateResult(points=[], raw_detection_count=raw_count, kept_detection_count=0)
 
-        keep = self._nms_indices(boxes, iou_threshold=self.nms_threshold)
+        keep = self._nms_indices(boxes, iou_threshold=self.iou_threshold)
         if keep.size == 0:
             return ArcheryAutoAnnotateResult(points=[], raw_detection_count=raw_count, kept_detection_count=0)
 

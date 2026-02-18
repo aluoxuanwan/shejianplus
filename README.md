@@ -53,3 +53,32 @@ python run.py
   2. Halpe26 自动预标注推理
   3. 训练任务子进程调度
   4. 摄像头实时推理与 CSV 导出
+
+## Training Requirements (v0.3)
+
+- `mmpose==1.3.2` is required for GUI training. If version mismatch is detected, config generation and training start are blocked.
+- Keypoint-set JSON import is supported in both Annotate and Train pages.
+- Keypoint-set files are copied into `<project>/config/keypoint_sets/`.
+- Index file: `<project>/config/keypoint_sets/project_keypoint_sets.json`.
+- JSON schema (v1):
+
+```json
+{
+  "schema_version": 1,
+  "set_name": "archery_5_v1",
+  "keypoints": [
+    {"id": 0, "name": "UP"},
+    {"id": 1, "name": "DOWN"},
+    {"id": 2, "name": "FL"},
+    {"id": 3, "name": "ST"},
+    {"id": 4, "name": "FS"}
+  ]
+}
+```
+
+- Manual annotation format is unchanged:
+
+```json
+{"human_keypoints": [...], "archery_keypoints": [...]}
+```
+

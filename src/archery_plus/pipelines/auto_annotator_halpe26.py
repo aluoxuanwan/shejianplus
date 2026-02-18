@@ -7,35 +7,9 @@ import cv2
 import numpy as np
 import onnxruntime as ort
 
+from archery_plus.core.keypoint_schema import DEFAULT_HUMAN_KEYPOINT_NAMES
 
-HALPE26_NAMES = [
-    "Nose",
-    "LEye",
-    "REye",
-    "LEar",
-    "REar",
-    "LShoulder",
-    "RShoulder",
-    "LElbow",
-    "RElbow",
-    "LWrist",
-    "RWrist",
-    "LHip",
-    "RHip",
-    "LKnee",
-    "RKnee",
-    "LAnkle",
-    "RAnkle",
-    "Head",
-    "Neck",
-    "Hip",
-    "LBigToe",
-    "RBigToe",
-    "LSmallToe",
-    "RSmallToe",
-    "LHeel",
-    "RHeel",
-]
+HALPE26_NAMES = list(DEFAULT_HUMAN_KEYPOINT_NAMES)
 
 
 @dataclass
@@ -49,11 +23,11 @@ class Halpe26AutoAnnotator:
         self,
         model_path: Path,
         confidence_threshold: float = 0.3,
-        nms_threshold: float = 0.5,
+        iou_threshold: float = 0.5,
     ) -> None:
         self.model_path = model_path
         self.confidence_threshold = float(confidence_threshold)
-        self.nms_threshold = float(nms_threshold)
+        self.iou_threshold = float(iou_threshold)
         self._session: ort.InferenceSession | None = None
         self._input_name: str | None = None
         self._input_hw: tuple[int, int] | None = None
@@ -65,9 +39,9 @@ class Halpe26AutoAnnotator:
         except Exception:
             return False
 
-    def set_thresholds(self, confidence_threshold: float, nms_threshold: float) -> None:
+    def set_thresholds(self, confidence_threshold: float, iou_threshold: float) -> None:
         self.confidence_threshold = float(confidence_threshold)
-        self.nms_threshold = float(nms_threshold)
+        self.iou_threshold = float(iou_threshold)
 
     def predict_image(self, image_path: Path) -> AutoAnnotateResult:
         image_bgr = cv2.imread(str(image_path))
@@ -80,7 +54,7 @@ class Halpe26AutoAnnotator:
         points = self._decode_to_points(simcc_x, simcc_y, orig_w=orig_w, orig_h=orig_h)
 
         filtered = [p for p in points if float(p["score"]) >= self.confidence_threshold]
-        filtered = self._nms_points(filtered, iou_threshold=self.nms_threshold)
+        filtered = self._nms_points(filtered, iou_threshold=self.iou_threshold)
 
         return AutoAnnotateResult(points=filtered, raw_count=len(points))
 
