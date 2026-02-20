@@ -53,9 +53,8 @@ class Halpe26AutoAnnotator:
         simcc_x, simcc_y = self._infer(input_tensor)
         points = self._decode_to_points(simcc_x, simcc_y, orig_w=orig_w, orig_h=orig_h)
 
+        # Keep model-native keypoint id order to avoid semantic remapping errors.
         filtered = [p for p in points if float(p["score"]) >= self.confidence_threshold]
-        filtered = self._nms_points(filtered, iou_threshold=self.iou_threshold)
-
         return AutoAnnotateResult(points=filtered, raw_count=len(points))
 
     def _ensure_session(self) -> None:
@@ -65,7 +64,6 @@ class Halpe26AutoAnnotator:
         if not self.model_path.exists():
             raise FileNotFoundError(f"Model not found: {self.model_path}")
 
-        # Force CPU to avoid noisy CUDA provider warnings on machines without full cuDNN runtime.
         self._session = ort.InferenceSession(str(self.model_path), providers=["CPUExecutionProvider"])
         input_meta = self._session.get_inputs()[0]
         self._input_name = input_meta.name
@@ -149,6 +147,7 @@ class Halpe26AutoAnnotator:
             name = HALPE26_NAMES[idx] if idx < len(HALPE26_NAMES) else f"H{idx:02d}"
             points.append(
                 {
+                    "id": idx,
                     "name": name,
                     "x": round(float(x), 2),
                     "y": round(float(y), 2),
@@ -162,36 +161,3 @@ class Halpe26AutoAnnotator:
     def _sigmoid(self, x: float) -> float:
         x = np.clip(x, -60.0, 60.0)
         return float(1.0 / (1.0 + np.exp(-x)))
-
-    def _nms_points(
-        self,
-        points: list[dict[str, float | str | int]],
-        iou_threshold: float,
-    ) -> list[dict[str, float | str | int]]:
-        # This model is single-person top-down in current MVP.
-        # Keep a lightweight point-level suppression so the nms control has effect.
-        if not points:
-            return []
-
-        threshold = float(np.clip(iou_threshold, 0.0, 1.0))
-        if threshold >= 0.999:
-            return points
-
-        radius = max(2.0, (1.0 - threshold) * 20.0)
-        radius2 = radius * radius
-
-        kept: list[dict[str, float | str | int]] = []
-        for point in sorted(points, key=lambda p: float(p.get("score", 0.0)), reverse=True):
-            px = float(point["x"])
-            py = float(point["y"])
-            duplicate = False
-            for kept_point in kept:
-                dx = px - float(kept_point["x"])
-                dy = py - float(kept_point["y"])
-                if (dx * dx + dy * dy) <= radius2:
-                    duplicate = True
-                    break
-            if not duplicate:
-                kept.append(point)
-
-        return kept

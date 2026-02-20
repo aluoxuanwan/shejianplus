@@ -99,11 +99,18 @@ class TrainingPreset:
     skeleton_info: str = ""
     joint_weights: str = ""
     sigmas: str = ""
-    epochs: int = 300
+    epochs: int = 100
     batch_size: int = 16
     num_workers: int = 4
-    image_size: int = 640
-    learning_rate: float = 0.004
+    input_width: int = 640
+    input_height: int = 640
+    image_size: int = 640  # legacy compatibility
+    learning_rate: float = 0.0001
+    aug_random_affine: bool = True
+    aug_mosaic: bool = True
+    aug_mixup: bool = True
+    aug_hsv: bool = True
+    aug_random_flip: bool = False
     optimizer: str = "AdamW"
     scheduler: str = "CosineAnnealingLR"
     train_ratio: float = 0.8
@@ -169,11 +176,18 @@ def default_training_preset(project_root: Path | None = None) -> TrainingPreset:
         pretrained_weight_path=pretrained_weight_path,
         base_config_path=base_config_path,
         category_name=_default_category_name(root, target_name),
-        epochs=300,
+        epochs=100,
         batch_size=16,
         num_workers=4,
+        input_width=640,
+        input_height=640,
         image_size=640,
-        learning_rate=0.004,
+        learning_rate=0.0001,
+        aug_random_affine=True,
+        aug_mosaic=True,
+        aug_mixup=True,
+        aug_hsv=True,
+        aug_random_flip=False,
         optimizer="AdamW",
         scheduler="CosineAnnealingLR",
         train_ratio=0.8,
@@ -201,8 +215,15 @@ def save_training_preset(path: Path, preset: TrainingPreset) -> None:
         "epochs": int(preset.epochs),
         "batch_size": int(preset.batch_size),
         "num_workers": int(preset.num_workers),
-        "image_size": int(preset.image_size),
+        "input_width": int(preset.input_width),
+        "input_height": int(preset.input_height),
+        "image_size": int(preset.input_width),
         "learning_rate": float(preset.learning_rate),
+        "aug_random_affine": bool(preset.aug_random_affine),
+        "aug_mosaic": bool(preset.aug_mosaic),
+        "aug_mixup": bool(preset.aug_mixup),
+        "aug_hsv": bool(preset.aug_hsv),
+        "aug_random_flip": bool(preset.aug_random_flip),
         "optimizer": preset.optimizer,
         "scheduler": preset.scheduler,
         "train_ratio": float(preset.train_ratio),
@@ -241,6 +262,10 @@ def load_training_preset(path: Path, fallback_project_root: Path | None = None) 
     if model_name not in MODEL_SPECS:
         model_name = default.model_name
 
+    legacy_size = int(raw.get("image_size", default.image_size))
+    input_width = int(raw.get("input_width", legacy_size))
+    input_height = int(raw.get("input_height", legacy_size))
+
     return TrainingPreset(
         project_dir=Path(str(raw.get("project_dir", default.project_dir))),
         dataset_dir=Path(str(raw.get("dataset_dir", default.dataset_dir))),
@@ -257,8 +282,15 @@ def load_training_preset(path: Path, fallback_project_root: Path | None = None) 
         epochs=int(raw.get("epochs", default.epochs)),
         batch_size=int(raw.get("batch_size", default.batch_size)),
         num_workers=int(raw.get("num_workers", default.num_workers)),
-        image_size=int(raw.get("image_size", default.image_size)),
+        input_width=max(64, input_width),
+        input_height=max(64, input_height),
+        image_size=legacy_size,
         learning_rate=float(raw.get("learning_rate", default.learning_rate)),
+        aug_random_affine=bool(raw.get("aug_random_affine", default.aug_random_affine)),
+        aug_mosaic=bool(raw.get("aug_mosaic", default.aug_mosaic)),
+        aug_mixup=bool(raw.get("aug_mixup", default.aug_mixup)),
+        aug_hsv=bool(raw.get("aug_hsv", default.aug_hsv)),
+        aug_random_flip=bool(raw.get("aug_random_flip", default.aug_random_flip)),
         optimizer=str(raw.get("optimizer", default.optimizer)),
         scheduler=str(raw.get("scheduler", default.scheduler)),
         train_ratio=float(raw.get("train_ratio", default.train_ratio)),
@@ -267,6 +299,12 @@ def load_training_preset(path: Path, fallback_project_root: Path | None = None) 
         random_seed=int(raw.get("random_seed", default.random_seed)),
         gpus=int(raw.get("gpus", default.gpus)),
     )
+
+
+def _resolve_input_size(preset: TrainingPreset) -> tuple[int, int]:
+    input_w = max(64, int(getattr(preset, "input_width", getattr(preset, "image_size", 640))))
+    input_h = max(64, int(getattr(preset, "input_height", getattr(preset, "image_size", 640))))
+    return (input_w, input_h)
 
 
 def generate_training_config(
@@ -306,6 +344,7 @@ def generate_training_config(
     scheduler_block = _build_scheduler_block(preset.scheduler, max_epochs)
     keypoint_names_literal = json.dumps(keypoint_names, ensure_ascii=False)
     persistent_workers_literal = "True" if int(preset.num_workers) > 0 else "False"
+    input_w, input_h = _resolve_input_size(preset)
 
     skeleton_info_literal = _build_skeleton_info_literal(preset.skeleton_info, keypoint_names)
     joint_weights_literal = _build_float_list_literal(preset.joint_weights, len(keypoint_names), default_value=1.0)
@@ -317,19 +356,27 @@ def generate_training_config(
         base_config_path=base_config,
         dataloader_key="train_dataloader",
         ann_var="train_ann_file",
-        image_size=int(preset.image_size),
+        input_size=(input_w, input_h),
+        is_train=True,
+        augment_flags={
+            "random_affine": bool(preset.aug_random_affine),
+            "mosaic": bool(preset.aug_mosaic),
+            "mixup": bool(preset.aug_mixup),
+            "hsv": bool(preset.aug_hsv),
+            "random_flip": bool(preset.aug_random_flip),
+        },
     )
     val_dataset_literal = _build_dataset_override_literal(
         base_config_path=base_config,
         dataloader_key="val_dataloader",
         ann_var="val_ann_file",
-        image_size=int(preset.image_size),
+        input_size=(input_w, input_h),
     )
     test_dataset_literal = _build_dataset_override_literal(
         base_config_path=base_config,
         dataloader_key="test_dataloader",
         ann_var="test_ann_file",
-        image_size=int(preset.image_size),
+        input_size=(input_w, input_h),
     )
 
     metainfo_dir = config_dir / "metainfo"
@@ -417,7 +464,7 @@ target_metainfo = dict(
     sigmas={sigmas_literal},
 )
 
-input_size = ({int(preset.image_size)}, {int(preset.image_size)})
+input_size = ({input_w}, {input_h})
 codec = dict(type='YOLOXPoseAnnotationProcessor', input_size=input_size)
 
 train_cfg = dict(max_epochs={max_epochs}, val_interval={val_interval})
@@ -724,10 +771,14 @@ def _build_dataset_override_literal(
     base_config_path: Path,
     dataloader_key: str,
     ann_var: str,
-    image_size: int,
+    input_size: tuple[int, int],
+    is_train: bool = False,
+    augment_flags: dict[str, bool] | None = None,
 ) -> str:
     dataset_type, data_mode, pipeline_obj, test_mode = _detect_dataset_template(base_config_path, dataloader_key)
-    pipeline_obj = _adapt_pipeline_input_size(pipeline_obj, image_size)
+    pipeline_obj = _adapt_pipeline_input_size(pipeline_obj, input_size)
+    if is_train:
+        pipeline_obj = _filter_train_pipeline_augmentations(pipeline_obj, augment_flags or {})
 
     lines = [
         "dict(",
@@ -802,10 +853,10 @@ def _detect_dataset_template(
         return default_type, default_mode, None, None
 
 
-def _adapt_pipeline_input_size(pipeline_obj: Any, image_size: int) -> Any:
+def _adapt_pipeline_input_size(pipeline_obj: Any, input_size: tuple[int, int]) -> Any:
     if pipeline_obj is None:
         return None
-    size = (int(image_size), int(image_size))
+    size = (int(input_size[0]), int(input_size[1]))
 
     def _walk(node: Any) -> Any:
         if isinstance(node, dict):
@@ -823,6 +874,28 @@ def _adapt_pipeline_input_size(pipeline_obj: Any, image_size: int) -> Any:
         return node
 
     return _walk(pipeline_obj)
+
+
+def _filter_train_pipeline_augmentations(pipeline_obj: Any, augment_flags: dict[str, bool]) -> Any:
+    if not isinstance(pipeline_obj, list):
+        return pipeline_obj
+
+    enable_map = {
+        "BottomupRandomAffine": bool(augment_flags.get("random_affine", True)),
+        "Mosaic": bool(augment_flags.get("mosaic", True)),
+        "YOLOXMixUp": bool(augment_flags.get("mixup", True)),
+        "YOLOXHSVRandomAug": bool(augment_flags.get("hsv", True)),
+        "RandomFlip": bool(augment_flags.get("random_flip", False)),
+    }
+
+    filtered: list[Any] = []
+    for step in pipeline_obj:
+        if isinstance(step, dict):
+            step_type = str(step.get("type", "")).strip()
+            if step_type in enable_map and not enable_map[step_type]:
+                continue
+        filtered.append(step)
+    return filtered
 
 
 def _detect_evaluator_type(config_path: Path, evaluator_key: str) -> tuple[str, str | None]:
@@ -907,3 +980,6 @@ def parse_dataset_meta(dataset_meta_path: Path) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise RuntimeError(f"Invalid dataset meta file: {dataset_meta_path}")
     return payload
+
+
+

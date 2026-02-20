@@ -26,6 +26,8 @@ class AnnotationCanvas(QWidget):
         self._archery_points: list[dict[str, Any]] = []
         self._human_points: list[dict[str, Any]] = []
         self._bboxes: list[dict[str, Any]] = []
+        self._archery_keypoint_labels: list[str] = []
+        self._human_keypoint_labels: list[str] = []
 
         self._edit_group = "archery"
         self._edit_mode = "keypoint"  # keypoint | bbox
@@ -34,6 +36,7 @@ class AnnotationCanvas(QWidget):
         self._selected_index: int | None = None
         self._dragging = False
         self._current_keypoint_name = "UP"
+        self._current_keypoint_id: int | None = None
         self._point_radius = 4.0
 
         self._current_bbox_name = "object"
@@ -84,20 +87,20 @@ class AnnotationCanvas(QWidget):
         return self.get_archery_points()
 
     def set_archery_points(self, points: list[dict[str, Any]]) -> None:
-        self._archery_points = points.copy()
+        self._archery_points = self._normalize_points(points, self._archery_keypoint_labels)
         self._selected_index = None
         self.update()
 
     def get_archery_points(self) -> list[dict[str, Any]]:
-        return self._archery_points.copy()
+        return self._export_points(self._archery_points, self._archery_keypoint_labels)
 
     def set_human_points(self, points: list[dict[str, Any]]) -> None:
-        self._human_points = points.copy()
+        self._human_points = self._normalize_points(points, self._human_keypoint_labels)
         self._selected_index = None
         self.update()
 
     def get_human_points(self) -> list[dict[str, Any]]:
-        return self._human_points.copy()
+        return self._export_points(self._human_points, self._human_keypoint_labels)
 
     def set_bboxes(self, bboxes: list[dict[str, Any]]) -> None:
         self._bboxes = bboxes.copy()
@@ -139,6 +142,25 @@ class AnnotationCanvas(QWidget):
 
     def set_current_keypoint_name(self, name: str) -> None:
         self._current_keypoint_name = name
+
+    def set_current_keypoint_id(self, keypoint_id: int | None) -> None:
+        if keypoint_id is None:
+            self._current_keypoint_id = None
+            return
+        try:
+            self._current_keypoint_id = int(keypoint_id)
+        except Exception:
+            self._current_keypoint_id = None
+
+    def set_archery_keypoint_labels(self, labels: list[str]) -> None:
+        self._archery_keypoint_labels = [str(x).strip() for x in labels if str(x).strip()]
+        self._archery_points = self._normalize_points(self._archery_points, self._archery_keypoint_labels)
+        self.update()
+
+    def set_human_keypoint_labels(self, labels: list[str]) -> None:
+        self._human_keypoint_labels = [str(x).strip() for x in labels if str(x).strip()]
+        self._human_points = self._normalize_points(self._human_points, self._human_keypoint_labels)
+        self.update()
 
     def set_current_bbox_name(self, name: str) -> None:
         self._current_bbox_name = name
@@ -208,15 +230,23 @@ class AnnotationCanvas(QWidget):
                 return
 
             x_img, y_img = image_pos
-            editable_points.append(
-                {
-                    "name": self._current_keypoint_name,
-                    "x": round(x_img, 2),
-                    "y": round(y_img, 2),
-                    "v": 2,
-                    "score": 0.0,
-                }
-            )
+            labels = self._labels_of_group(self._edit_group)
+            point_name = self._current_keypoint_name
+            point_id = self._current_keypoint_id
+            if point_id is not None and 0 <= point_id < len(labels):
+                point_name = labels[point_id]
+
+            point: dict[str, Any] = {
+                "name": point_name,
+                "x": round(x_img, 2),
+                "y": round(y_img, 2),
+                "v": 2,
+                "score": 0.0,
+            }
+            if point_id is not None:
+                point["id"] = int(point_id)
+
+            editable_points.append(point)
             self._selected_index = len(editable_points) - 1
             self.pointsChanged.emit()
             self.pointAdded.emit()
@@ -412,7 +442,7 @@ class AnnotationCanvas(QWidget):
             painter.drawEllipse(center, fill_radius, fill_radius)
 
             if hovered:
-                label_text = str(pt.get("name", "KP"))
+                label_text = self._resolve_point_label(pt, group)
                 self._draw_label_chip(
                     painter,
                     x_disp + ring_radius + 6.0,
@@ -483,6 +513,64 @@ class AnnotationCanvas(QWidget):
 
     def _points_of_group(self, group: str) -> list[dict[str, Any]]:
         return self._human_points if group == "human" else self._archery_points
+
+    def _labels_of_group(self, group: str) -> list[str]:
+        return self._human_keypoint_labels if group == "human" else self._archery_keypoint_labels
+
+    def _resolve_point_label(self, point: dict[str, Any], group: str) -> str:
+        labels = self._labels_of_group(group)
+        pid = point.get("id")
+        try:
+            pid_i = int(pid)
+        except Exception:
+            pid_i = -1
+
+        if 0 <= pid_i < len(labels):
+            return labels[pid_i]
+
+        raw_name = str(point.get("name", "")).strip()
+        return raw_name or "KP"
+
+    def _normalize_points(self, points: list[dict[str, Any]], labels: list[str]) -> list[dict[str, Any]]:
+        normalized: list[dict[str, Any]] = []
+        for item in points:
+            if not isinstance(item, dict):
+                continue
+            one = dict(item)
+
+            raw_name = str(one.get("name", "")).strip()
+            pid = one.get("id")
+            pid_i: int | None = None
+            try:
+                pid_i = int(pid)
+            except Exception:
+                if raw_name and raw_name in labels:
+                    pid_i = labels.index(raw_name)
+
+            if pid_i is not None and 0 <= pid_i < len(labels):
+                one["id"] = int(pid_i)
+                one["name"] = labels[pid_i]
+            else:
+                one.pop("id", None)
+                one["name"] = raw_name
+
+            normalized.append(one)
+        return normalized
+
+    def _export_points(self, points: list[dict[str, Any]], labels: list[str]) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for item in points:
+            one = dict(item)
+            pid = one.get("id")
+            try:
+                pid_i = int(pid)
+            except Exception:
+                pid_i = -1
+            if 0 <= pid_i < len(labels):
+                one["name"] = labels[pid_i]
+                one["id"] = int(pid_i)
+            out.append(one)
+        return out
 
     def _find_nearest_visible_point(self, pos: QPointF, threshold: float) -> tuple[str | None, int | None]:
         best_group: str | None = None

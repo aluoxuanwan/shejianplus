@@ -398,6 +398,7 @@ class AnnotatePage(QWidget):
         else:
             self._last_archery_kp = name
         self.canvas.set_current_keypoint_name(name)
+        self.canvas.set_current_keypoint_id(self.kp_combo.currentIndex())
 
     def _on_bbox_label_changed(self, name: str) -> None:
         if not name:
@@ -445,6 +446,9 @@ class AnnotatePage(QWidget):
         self.bbox_label_combo.blockSignals(False)
         if self.kp_combo.currentText():
             self.canvas.set_current_keypoint_name(self.kp_combo.currentText())
+            self.canvas.set_current_keypoint_id(self.kp_combo.currentIndex())
+        else:
+            self.canvas.set_current_keypoint_id(None)
         if self.bbox_label_combo.currentText():
             self.canvas.set_current_bbox_name(self.bbox_label_combo.currentText())
 
@@ -481,6 +485,9 @@ class AnnotatePage(QWidget):
         self._human_keypoint_labels = list(schema.get("human_keypoint_labels", []))
         self._archery_keypoint_labels = list(schema.get("archery_keypoint_labels", []))
         self._bbox_labels = list(schema.get("bbox_labels", []))
+
+        self.canvas.set_human_keypoint_labels(self._human_keypoint_labels)
+        self.canvas.set_archery_keypoint_labels(self._archery_keypoint_labels)
 
         self._refresh_label_views()
         self._update_auto_annotation_availability()
@@ -574,14 +581,7 @@ class AnnotatePage(QWidget):
 
         if isinstance(raw.get("keypoints"), list):
             keypoints = raw.get("keypoints", [])
-            names: list[str] = []
-            for item in keypoints:
-                if isinstance(item, dict):
-                    name = str(item.get("name", "")).strip()
-                else:
-                    name = str(item).strip()
-                if name and name not in names:
-                    names.append(name)
+            names = self._parse_keypoint_names_by_id(keypoints)
             if not names:
                 raise RuntimeError("keypoints 为空或无有效名称。")
             self._store.set_keypoint_labels(self._current_target(), names)
@@ -614,6 +614,45 @@ class AnnotatePage(QWidget):
             if name and name not in names:
                 names.append(name)
         return names
+
+    def _parse_keypoint_names_by_id(self, raw: list[Any]) -> list[str]:
+        by_id: dict[int, str] = {}
+        fallback: list[str] = []
+
+        for item in raw:
+            if isinstance(item, dict):
+                name = str(item.get("name", "")).strip()
+                if not name:
+                    continue
+                if "id" in item:
+                    try:
+                        kid = int(item.get("id"))
+                    except Exception:
+                        raise RuntimeError(f"关键点 id 非法: {item.get('id')}")
+                    if kid < 0:
+                        raise RuntimeError("关键点 id 不能为负数。")
+                    if kid in by_id and by_id[kid] != name:
+                        raise RuntimeError(f"关键点 id 重复且名称冲突: id={kid}")
+                    by_id[kid] = name
+                elif name not in fallback:
+                    fallback.append(name)
+            else:
+                name = str(item).strip()
+                if name and name not in fallback:
+                    fallback.append(name)
+
+        if by_id:
+            ids = sorted(by_id.keys())
+            expected = list(range(len(ids)))
+            if ids != expected:
+                raise RuntimeError("关键点 id 必须从0开始连续。")
+            ordered = [by_id[i] for i in ids]
+            for name in fallback:
+                if name not in ordered:
+                    ordered.append(name)
+            return ordered
+
+        return fallback
 
     def _add_keypoint_label(self) -> None:
         target = self._current_target()
@@ -684,8 +723,25 @@ class AnnotatePage(QWidget):
         mapped: list[dict[str, Any]] = []
         for idx, point in enumerate(points):
             item = dict(point)
-            if idx < len(names):
-                item["name"] = names[idx]
+
+            pid_raw = item.get("id", None)
+            try:
+                pid = int(pid_raw)
+            except Exception:
+                pid = -1
+
+            if 0 <= pid < len(names):
+                item["id"] = pid
+                item["name"] = names[pid]
+            else:
+                raw_name = str(item.get("name", "")).strip()
+                if raw_name and raw_name in names:
+                    item["name"] = raw_name
+                    item["id"] = names.index(raw_name)
+                elif idx < len(names):
+                    item["name"] = names[idx]
+                    item["id"] = idx
+
             mapped.append(item)
         return mapped
 
@@ -847,3 +903,5 @@ class AnnotatePage(QWidget):
             idx = self.image_list.currentRow() + 1 if self.image_list.currentRow() >= 0 else 0
 
         self.cursor_status_label.setText(f"(X:{x_text},Y:{y_text})[图片名称:{name} {idx}/{total}]")
+
+

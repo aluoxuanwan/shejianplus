@@ -10,6 +10,7 @@ from pathlib import Path
 from PySide6.QtCore import QProcess, QProcessEnvironment, Qt
 from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
@@ -146,6 +147,21 @@ class TrainPage(QWidget):
         self._last_target_key = TARGET_HUMAN
         self._category_name_by_target: dict[str, str] = {TARGET_HUMAN: "", TARGET_ARCHERY: ""}
         self._metric_step = 0
+        self._latest_metrics: dict[str, float | None] = {
+            "loss": None,
+            "mAP": None,
+            "precision": None,
+            "recall": None,
+        }
+        self._best_metrics: dict[str, float | None] = {
+            "loss": None,
+            "mAP": None,
+            "precision": None,
+            "recall": None,
+        }
+        self._latest_epoch: int | None = None
+        self._latest_iter: tuple[int, int] | None = None
+        self._latest_eta: str = "-"
         self._shown_low_pagefile_hint = False
         self._shown_encoding_hint = False
 
@@ -154,6 +170,7 @@ class TrainPage(QWidget):
         preset = default_training_preset(self._project_dir)
         self._apply_preset_to_ui(preset)
         self._on_init_mode_changed(self.init_mode_combo.currentText())
+        self._apply_model_input_size_policy()
         self._refresh_keypoint_set_info(show_errors=False, set_category_from_set=True)
 
     def _build_ui(self) -> None:
@@ -165,7 +182,7 @@ class TrainPage(QWidget):
         left_layout = QVBoxLayout(left_panel)
 
         info = QLabel(
-            f"训练模块 v0.3：项目目录固定为 {self._project_dir}，左侧配置+日志，右侧实时 loss/precision 曲线。"
+            f"训练模块 v0.3：项目目录固定为 {self._project_dir}，左侧配置+日志，右侧显示 loss/precision 曲线与 mAP/recall 实时状态。"
         )
         info.setWordWrap(True)
         left_layout.addWidget(info)
@@ -255,54 +272,108 @@ class TrainPage(QWidget):
         self.category_edit.setPlaceholderText("类别名称（默认=集合名）")
         category_row.addWidget(self.category_edit)
 
-        hp_row_1 = QHBoxLayout()
+        hp_row = QHBoxLayout()
         self.epochs_spin = QSpinBox()
         self.epochs_spin.setRange(1, 5000)
-        self.epochs_spin.setValue(300)
+        self.epochs_spin.setValue(100)
         self.epochs_spin.setPrefix("epoch=")
-        hp_row_1.addWidget(self.epochs_spin)
+        hp_row.addWidget(self.epochs_spin)
 
         self.batch_spin = QSpinBox()
         self.batch_spin.setRange(1, 512)
         self.batch_spin.setValue(16)
         self.batch_spin.setPrefix("batch=")
-        hp_row_1.addWidget(self.batch_spin)
+        hp_row.addWidget(self.batch_spin)
 
         self.workers_spin = QSpinBox()
         self.workers_spin.setRange(0, 64)
         self.workers_spin.setValue(4)
         self.workers_spin.setPrefix("workers=")
-        hp_row_1.addWidget(self.workers_spin)
+        hp_row.addWidget(self.workers_spin)
 
         self.gpus_spin = QSpinBox()
         self.gpus_spin.setRange(0, 8)
         self.gpus_spin.setValue(1)
         self.gpus_spin.setPrefix("gpus=")
-        hp_row_1.addWidget(self.gpus_spin)
+        hp_row.addWidget(self.gpus_spin)
 
-        hp_row_2 = QHBoxLayout()
-        self.image_size_spin = QSpinBox()
-        self.image_size_spin.setRange(64, 2048)
-        self.image_size_spin.setSingleStep(32)
-        self.image_size_spin.setValue(640)
-        self.image_size_spin.setPrefix("img=")
-        hp_row_2.addWidget(self.image_size_spin)
+        self.input_w_spin = QSpinBox()
+        self.input_w_spin.setRange(64, 2048)
+        self.input_w_spin.setSingleStep(32)
+        self.input_w_spin.setValue(640)
+        self.input_w_spin.setPrefix("w=")
+        self.input_w_spin.valueChanged.connect(self._on_input_size_changed)
+        hp_row.addWidget(self.input_w_spin)
+
+        self.input_h_spin = QSpinBox()
+        self.input_h_spin.setRange(64, 2048)
+        self.input_h_spin.setSingleStep(32)
+        self.input_h_spin.setValue(640)
+        self.input_h_spin.setPrefix("h=")
+        self.input_h_spin.valueChanged.connect(self._on_input_size_changed)
+        hp_row.addWidget(self.input_h_spin)
+
+        self.input_size_hint_label = QLabel("input_size=640x640")
+        hp_row.addWidget(self.input_size_hint_label)
+
 
         self.lr_spin = QDoubleSpinBox()
         self.lr_spin.setDecimals(6)
         self.lr_spin.setRange(0.000001, 1.0)
         self.lr_spin.setSingleStep(0.0001)
-        self.lr_spin.setValue(0.004)
+        self.lr_spin.setValue(0.0001)
         self.lr_spin.setPrefix("lr=")
-        hp_row_2.addWidget(self.lr_spin)
+        hp_row.addWidget(self.lr_spin)
 
         self.optimizer_combo = QComboBox()
         self.optimizer_combo.addItems(OPTIMIZER_OPTIONS)
-        hp_row_2.addWidget(self.optimizer_combo)
+        hp_row.addWidget(self.optimizer_combo)
 
         self.scheduler_combo = QComboBox()
         self.scheduler_combo.addItems(SCHEDULER_OPTIONS)
-        hp_row_2.addWidget(self.scheduler_combo)
+        hp_row.addWidget(self.scheduler_combo)
+
+        self.train_params_help_label = QLabel("ⓘ")
+        self.train_params_help_label.setStyleSheet("color:#2c3e50; font-weight:700; padding:0 6px;")
+        self.train_params_help_label.setToolTip(
+            "epoch: 训练轮数\n"
+            "batch: 每卡每步样本数\n"
+            "workers: DataLoader 线程数\n"
+            "gpus: 使用GPU数量（0=CPU）\n"
+            "w/h: 输入宽高（默认随模型带出，可编辑）\n"
+            "input_size: 实际写入配置的输入尺寸\n"
+            "lr: 初始学习率\n"
+            "optimizer/scheduler: 优化器与学习率策略"
+        )
+        hp_row.addWidget(self.train_params_help_label)
+        hp_row.addStretch(1)
+
+        aug_row = QHBoxLayout()
+        self.aug_affine_chk = QCheckBox("Affine")
+        self.aug_affine_chk.setChecked(True)
+        self.aug_affine_chk.setToolTip("BottomupRandomAffine")
+        aug_row.addWidget(self.aug_affine_chk)
+
+        self.aug_mosaic_chk = QCheckBox("Mosaic")
+        self.aug_mosaic_chk.setChecked(True)
+        self.aug_mosaic_chk.setToolTip("Mosaic拼接增强")
+        aug_row.addWidget(self.aug_mosaic_chk)
+
+        self.aug_mixup_chk = QCheckBox("MixUp")
+        self.aug_mixup_chk.setChecked(True)
+        self.aug_mixup_chk.setToolTip("YOLOXMixUp")
+        aug_row.addWidget(self.aug_mixup_chk)
+
+        self.aug_hsv_chk = QCheckBox("HSV")
+        self.aug_hsv_chk.setChecked(True)
+        self.aug_hsv_chk.setToolTip("YOLOXHSVRandomAug")
+        aug_row.addWidget(self.aug_hsv_chk)
+
+        self.aug_flip_chk = QCheckBox("RandomFlip")
+        self.aug_flip_chk.setChecked(False)
+        self.aug_flip_chk.setToolTip("默认关闭，避免左右点swap未配置时污染训练")
+        aug_row.addWidget(self.aug_flip_chk)
+        aug_row.addStretch(1)
 
         self.skeleton_edit = QPlainTextEdit()
         self.skeleton_edit.setPlaceholderText('{"0":{"link":["up","bowstring"],"id":0,"color":[100,150,200]}}')
@@ -359,8 +430,8 @@ class TrainPage(QWidget):
         form.addRow("数据目录", dataset_row)
         form.addRow("关键点集合", keypoint_set_row)
         form.addRow("类别名称", category_row)
-        form.addRow("训练参数(1)", hp_row_1)
-        form.addRow("训练参数(2)", hp_row_2)
+        form.addRow("训练参数", hp_row)
+        form.addRow("图像增强", aug_row)
         form.addRow("skeleton_info", self.skeleton_edit)
         form.addRow("joint_weights", self.joint_weights_edit)
         form.addRow("sigmas", self.sigmas_edit)
@@ -398,6 +469,23 @@ class TrainPage(QWidget):
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
 
+        status_box = QGroupBox("训练状态")
+        status_layout = QVBoxLayout(status_box)
+
+        self.run_status_label = QLabel("状态: 未开始")
+        self.progress_label = QLabel("进度: epoch=- | iter=-/- | ETA=-")
+        self.metric_label = QLabel("当前指标: loss=- | mAP=- | precision=- | recall=-")
+        self.best_metric_label = QLabel("最佳指标: loss=- | mAP=- | precision=- | recall=-")
+        self.metric_label.setWordWrap(True)
+        self.best_metric_label.setWordWrap(True)
+
+        status_layout.addWidget(self.run_status_label)
+        status_layout.addWidget(self.progress_label)
+        status_layout.addWidget(self.metric_label)
+        status_layout.addWidget(self.best_metric_label)
+
+        right_layout.addWidget(status_box)
+
         self.loss_chart = LineChartWidget("Loss", QColor(255, 121, 97))
         self.precision_chart = LineChartWidget("Precision/mAP", QColor(88, 202, 140))
 
@@ -406,9 +494,9 @@ class TrainPage(QWidget):
 
         splitter.addWidget(left_panel)
         splitter.addWidget(right_panel)
-        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([760, 940])
+        splitter.setSizes([900, 900])
 
         root.addWidget(splitter)
 
@@ -416,9 +504,61 @@ class TrainPage(QWidget):
         self.log.clear()
 
     def _clear_curves(self) -> None:
+        self._reset_metric_views(reset_status=False)
+
+    def _reset_metric_views(self, reset_status: bool) -> None:
         self._metric_step = 0
         self.loss_chart.clear_data()
         self.precision_chart.clear_data()
+
+        self._latest_metrics = {"loss": None, "mAP": None, "precision": None, "recall": None}
+        self._best_metrics = {"loss": None, "mAP": None, "precision": None, "recall": None}
+        self._latest_epoch = None
+        self._latest_iter = None
+        self._latest_eta = "-"
+
+        if reset_status:
+            self.run_status_label.setText("状态: 未开始")
+        self._update_progress_label()
+        self._update_metric_labels()
+
+    def _update_progress_label(self) -> None:
+        epoch_text = str(self._latest_epoch) if self._latest_epoch is not None else "-"
+        if self._latest_iter is None:
+            iter_text = "-/-"
+        else:
+            iter_text = f"{self._latest_iter[0]}/{self._latest_iter[1]}"
+        self.progress_label.setText(f"进度: epoch={epoch_text} | iter={iter_text} | ETA={self._latest_eta}")
+
+    def _fmt_metric(self, value: float | None) -> str:
+        return "-" if value is None else f"{value:.4f}"
+
+    def _update_metric_labels(self) -> None:
+        self.metric_label.setText(
+            "当前指标: "
+            f"loss={self._fmt_metric(self._latest_metrics['loss'])} | "
+            f"mAP={self._fmt_metric(self._latest_metrics['mAP'])} | "
+            f"precision={self._fmt_metric(self._latest_metrics['precision'])} | "
+            f"recall={self._fmt_metric(self._latest_metrics['recall'])}"
+        )
+        self.best_metric_label.setText(
+            "最佳指标: "
+            f"loss={self._fmt_metric(self._best_metrics['loss'])} | "
+            f"mAP={self._fmt_metric(self._best_metrics['mAP'])} | "
+            f"precision={self._fmt_metric(self._best_metrics['precision'])} | "
+            f"recall={self._fmt_metric(self._best_metrics['recall'])}"
+        )
+
+    def _update_metric_value(self, name: str, value: float, lower_is_better: bool) -> None:
+        self._latest_metrics[name] = value
+        best = self._best_metrics.get(name)
+        if best is None:
+            self._best_metrics[name] = value
+            return
+        if lower_is_better and value < best:
+            self._best_metrics[name] = value
+        if (not lower_is_better) and value > best:
+            self._best_metrics[name] = value
 
     def _current_target_key(self) -> str:
         return TARGET_ARCHERY if self.target_combo.currentIndex() == 1 else TARGET_HUMAN
@@ -448,7 +588,7 @@ class TrainPage(QWidget):
             return
 
         if force or not self.joint_weights_edit.text().strip():
-            self.joint_weights_edit.setText(str([1.0 for _ in keypoint_names]))
+            self.joint_weights_edit.setText(str(self._default_joint_weights_for_keypoints(keypoint_names)))
         if force or not self.sigmas_edit.text().strip():
             self.sigmas_edit.setText(str([0.05 for _ in keypoint_names]))
 
@@ -462,6 +602,67 @@ class TrainPage(QWidget):
                 for i in range(max(0, len(keypoint_names) - 1))
             }
             self.skeleton_edit.setPlainText(str(skeleton))
+
+    def _default_joint_weights_for_keypoints(self, keypoint_names: list[str]) -> list[float]:
+        normalized = [str(name).strip().lower().replace("_", "") for name in keypoint_names]
+        halpe26_order = [
+            "nose",
+            "leye",
+            "reye",
+            "lear",
+            "rear",
+            "lshoulder",
+            "rshoulder",
+            "lelbow",
+            "relbow",
+            "lwrist",
+            "rwrist",
+            "lhip",
+            "rhip",
+            "lknee",
+            "rknee",
+            "lankle",
+            "rankle",
+            "head",
+            "neck",
+            "hip",
+            "lbigtoe",
+            "rbigtoe",
+            "lsmalltoe",
+            "rsmalltoe",
+            "lheel",
+            "rheel",
+        ]
+        if len(normalized) == 26 and normalized == halpe26_order:
+            return [
+                1.0,
+                1.0,
+                1.0,
+                1.0,
+                1.0,
+                1.0,
+                1.0,
+                1.2,
+                1.2,
+                1.5,
+                1.5,
+                1.0,
+                1.0,
+                1.2,
+                1.2,
+                1.5,
+                1.5,
+                1.0,
+                1.0,
+                1.2,
+                1.5,
+                1.5,
+                1.5,
+                1.5,
+                1.5,
+                1.5,
+            ]
+        return [1.0 for _ in keypoint_names]
 
     def _import_keypoint_set_for_current_target(self) -> None:
         source, _ = QFileDialog.getOpenFileName(
@@ -708,8 +909,15 @@ class TrainPage(QWidget):
             epochs=int(self.epochs_spin.value()),
             batch_size=int(self.batch_spin.value()),
             num_workers=int(self.workers_spin.value()),
-            image_size=int(self.image_size_spin.value()),
+            input_width=int(self.input_w_spin.value()),
+            input_height=int(self.input_h_spin.value()),
+            image_size=int(self.input_w_spin.value()),
             learning_rate=float(self.lr_spin.value()),
+            aug_random_affine=bool(self.aug_affine_chk.isChecked()),
+            aug_mosaic=bool(self.aug_mosaic_chk.isChecked()),
+            aug_mixup=bool(self.aug_mixup_chk.isChecked()),
+            aug_hsv=bool(self.aug_hsv_chk.isChecked()),
+            aug_random_flip=bool(self.aug_flip_chk.isChecked()),
             optimizer=self.optimizer_combo.currentText().strip() or OPTIMIZER_OPTIONS[0],
             scheduler=self.scheduler_combo.currentText().strip() or SCHEDULER_OPTIONS[0],
             train_ratio=float(self.train_ratio_spin.value()),
@@ -718,7 +926,6 @@ class TrainPage(QWidget):
             random_seed=42,
             gpus=int(self.gpus_spin.value()),
         )
-
     def _apply_preset_to_ui(self, preset: TrainingPreset) -> None:
         self.dataset_dir_edit.setText(str(preset.dataset_dir))
 
@@ -743,13 +950,20 @@ class TrainPage(QWidget):
         self.epochs_spin.setValue(max(1, int(preset.epochs)))
         self.batch_spin.setValue(max(1, int(preset.batch_size)))
         self.workers_spin.setValue(max(0, int(preset.num_workers)))
-        self.image_size_spin.setValue(max(64, int(preset.image_size)))
+        self.input_w_spin.setValue(max(64, int(getattr(preset, "input_width", preset.image_size))))
+        self.input_h_spin.setValue(max(64, int(getattr(preset, "input_height", preset.image_size))))
         self.lr_spin.setValue(max(0.000001, float(preset.learning_rate)))
+        self.aug_affine_chk.setChecked(bool(getattr(preset, "aug_random_affine", True)))
+        self.aug_mosaic_chk.setChecked(bool(getattr(preset, "aug_mosaic", True)))
+        self.aug_mixup_chk.setChecked(bool(getattr(preset, "aug_mixup", True)))
+        self.aug_hsv_chk.setChecked(bool(getattr(preset, "aug_hsv", True)))
+        self.aug_flip_chk.setChecked(bool(getattr(preset, "aug_random_flip", False)))
         self.gpus_spin.setValue(max(0, int(preset.gpus)))
 
         self.train_ratio_spin.setValue(max(0.0, float(preset.train_ratio)))
         self.val_ratio_spin.setValue(max(0.0, float(preset.val_ratio)))
         self.test_ratio_spin.setValue(max(0.0, float(preset.test_ratio)))
+        self._apply_model_input_size_policy()
 
     def _set_combo(self, combo: QComboBox, value: str) -> None:
         idx = combo.findText(value)
@@ -778,6 +992,7 @@ class TrainPage(QWidget):
         self.base_config_edit.setText(str(config_path))
         if self.init_mode_combo.currentText() == INIT_MODE_OPTIONS[0]:
             self.pretrained_weight_edit.setText(str(weight_path) if weight_path and weight_path.exists() else "")
+        self._apply_model_input_size_policy()
 
     def _on_init_mode_changed(self, mode_text: str) -> None:
         use_pretrained = mode_text == INIT_MODE_OPTIONS[0]
@@ -790,6 +1005,35 @@ class TrainPage(QWidget):
             except Exception:
                 weight_path = None
             self.pretrained_weight_edit.setText(str(weight_path) if weight_path and weight_path.exists() else "")
+
+    def _is_halpe26_model(self) -> bool:
+        model_name = self.model_combo.currentText().strip().lower()
+        return "halpe26" in model_name
+
+    def _refresh_input_size_hint(self) -> None:
+        w = int(self.input_w_spin.value())
+        h = int(self.input_h_spin.value())
+        model_tip = " (HALPE26默认)" if self._is_halpe26_model() else ""
+        self.input_size_hint_label.setText(f"input_size={w}x{h}{model_tip}")
+
+    def _apply_model_input_size_policy(self) -> None:
+        if self._is_halpe26_model():
+            if int(self.input_w_spin.value()) == 640 and int(self.input_h_spin.value()) == 640:
+                self.input_w_spin.blockSignals(True)
+                self.input_h_spin.blockSignals(True)
+                self.input_w_spin.setValue(288)
+                self.input_h_spin.setValue(384)
+                self.input_w_spin.blockSignals(False)
+                self.input_h_spin.blockSignals(False)
+            self.input_w_spin.setToolTip("HALPE26 默认输入尺寸 288x384，可编辑")
+            self.input_h_spin.setToolTip("HALPE26 默认输入尺寸 288x384，可编辑")
+        else:
+            self.input_w_spin.setToolTip("")
+            self.input_h_spin.setToolTip("")
+        self._refresh_input_size_hint()
+
+    def _on_input_size_changed(self, _value: int) -> None:
+        self._refresh_input_size_hint()
 
     def _start_training(self) -> None:
         if not self._check_mmpose_version_gate(show_message=True):
@@ -807,6 +1051,9 @@ class TrainPage(QWidget):
         if not self._project_dir.exists():
             QMessageBox.warning(self, "提示", f"项目目录不存在: {self._project_dir}")
             return
+
+        self._reset_metric_views(reset_status=False)
+        self.run_status_label.setText("状态: 运行中")
 
         process = QProcess(self)
         process.setWorkingDirectory(str(self._project_dir))
@@ -889,6 +1136,7 @@ class TrainPage(QWidget):
         process.start(program, args)
         if not process.waitForStarted(5000):
             self._append_log("[ERROR] 启动失败：无法拉起训练进程。")
+            self.run_status_label.setText("状态: 启动失败")
             QMessageBox.critical(self, "启动失败", "无法拉起训练进程，请检查命令是否正确。")
             process.deleteLater()
             return
@@ -903,6 +1151,7 @@ class TrainPage(QWidget):
             return
 
         self._append_log("[INFO] 正在停止训练任务...")
+        self.run_status_label.setText("状态: 正在停止")
         self._process.terminate()
         if not self._process.waitForFinished(3000):
             self._process.kill()
@@ -934,10 +1183,29 @@ class TrainPage(QWidget):
             self._append_log(text.rstrip("\n"))
 
     def _on_finished(self, exit_code: int, _exit_status) -> None:  # type: ignore[override]
+        if exit_code == 0:
+            self.run_status_label.setText("状态: 已完成")
+        else:
+            self.run_status_label.setText(f"状态: 失败(退出码={exit_code})")
+
+        self._append_log(
+            "[INFO] 训练摘要: "
+            f"latest(loss/mAP/precision/recall)="
+            f"{self._fmt_metric(self._latest_metrics['loss'])}/"
+            f"{self._fmt_metric(self._latest_metrics['mAP'])}/"
+            f"{self._fmt_metric(self._latest_metrics['precision'])}/"
+            f"{self._fmt_metric(self._latest_metrics['recall'])} | "
+            f"best(loss/mAP/precision/recall)="
+            f"{self._fmt_metric(self._best_metrics['loss'])}/"
+            f"{self._fmt_metric(self._best_metrics['mAP'])}/"
+            f"{self._fmt_metric(self._best_metrics['precision'])}/"
+            f"{self._fmt_metric(self._best_metrics['recall'])}"
+        )
         self._append_log(f"[INFO] Training finished, exit code: {exit_code}")
         self._cleanup_process_state()
 
     def _on_error(self, error) -> None:  # type: ignore[override]
+        self.run_status_label.setText("状态: 子进程异常")
         self._append_log(f"[ERROR] Training process error: {error}")
 
     def _cleanup_process_state(self) -> None:
@@ -952,6 +1220,7 @@ class TrainPage(QWidget):
             return
         for line in text.splitlines():
             self.log.append(line)
+            self._parse_and_update_progress(line)
             self._parse_and_plot_metrics(line)
 
             low_pagefile = (
@@ -975,6 +1244,27 @@ class TrainPage(QWidget):
                 self.log.append("[HINT] Windows subprocess now avoids forced PYTHONUTF8/PYTHONIOENCODING.")
                 self.log.append("[HINT] Please restart GUI and run training again.")
 
+    def _parse_and_update_progress(self, line: str) -> None:
+        epoch_iter = re.search(r"Epoch(?:\((?:train|val|test)\))?\s*\[(\d+)\]\[(\d+)/(\d+)\]", line, flags=re.IGNORECASE)
+        changed = False
+        if epoch_iter:
+            self._latest_epoch = int(epoch_iter.group(1))
+            self._latest_iter = (int(epoch_iter.group(2)), int(epoch_iter.group(3)))
+            changed = True
+
+        epoch_only = re.search(r"(?:^|\s)epoch\s*[:=]\s*(\d+)", line, flags=re.IGNORECASE)
+        if epoch_only:
+            self._latest_epoch = int(epoch_only.group(1))
+            changed = True
+
+        eta_match = re.search(r"(?:^|\s)eta\s*[:=]\s*([0-9]{1,3}:[0-9]{2}:[0-9]{2})", line, flags=re.IGNORECASE)
+        if eta_match:
+            self._latest_eta = eta_match.group(1)
+            changed = True
+
+        if changed:
+            self._update_progress_label()
+
     def _parse_and_plot_metrics(self, line: str) -> None:
         loss = self._extract_metric(
             line,
@@ -984,24 +1274,52 @@ class TrainPage(QWidget):
                 r'"loss"\s*:\s*([0-9]+(?:\.[0-9]+)?)',
             ],
         )
-        precision = self._extract_metric(
+        map_value = self._extract_metric(
             line,
             [
-                r"(?:precision|mAP|AP50|AP)\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)",
-                r"coco/AP\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)",
+                r"(?:mAP|coco/AP)\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)",
+                r"'mAP'\s*:\s*([0-9]+(?:\.[0-9]+)?)",
+                r'"mAP"\s*:\s*([0-9]+(?:\.[0-9]+)?)',
                 r"'coco/AP'\s*:\s*([0-9]+(?:\.[0-9]+)?)",
                 r'"coco/AP"\s*:\s*([0-9]+(?:\.[0-9]+)?)',
             ],
         )
+        precision = self._extract_metric(
+            line,
+            [
+                r"(?:precision|prec)\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)",
+                r"'precision'\s*:\s*([0-9]+(?:\.[0-9]+)?)",
+                r'"precision"\s*:\s*([0-9]+(?:\.[0-9]+)?)',
+            ],
+        )
+        recall = self._extract_metric(
+            line,
+            [
+                r"(?:recall|coco/AR|\bAR\b)\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)",
+                r"'recall'\s*:\s*([0-9]+(?:\.[0-9]+)?)",
+                r'"recall"\s*:\s*([0-9]+(?:\.[0-9]+)?)',
+            ],
+        )
 
-        if loss is None and precision is None:
+        if loss is None and map_value is None and precision is None and recall is None:
             return
+
+        curve_value = precision if precision is not None else map_value
 
         self._metric_step += 1
         if loss is not None:
             self.loss_chart.add_point(self._metric_step, loss)
+            self._update_metric_value("loss", loss, lower_is_better=True)
+        if map_value is not None:
+            self._update_metric_value("mAP", map_value, lower_is_better=False)
         if precision is not None:
-            self.precision_chart.add_point(self._metric_step, precision)
+            self._update_metric_value("precision", precision, lower_is_better=False)
+        if recall is not None:
+            self._update_metric_value("recall", recall, lower_is_better=False)
+        if curve_value is not None:
+            self.precision_chart.add_point(self._metric_step, curve_value)
+
+        self._update_metric_labels()
 
     def _extract_metric(self, line: str, patterns: list[str]) -> float | None:
         for pattern in patterns:
@@ -1013,3 +1331,4 @@ class TrainPage(QWidget):
             except Exception:
                 continue
         return None
+

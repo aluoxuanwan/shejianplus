@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
@@ -48,9 +48,14 @@ class RtmoArcheryAutoAnnotator:
         image_bgr = cv2.imread(str(image_path))
         if image_bgr is None:
             raise RuntimeError(f"Cannot read image: {image_path}")
+        return self.predict_frame(image_bgr)
 
-        orig_h, orig_w = image_bgr.shape[:2]
-        input_tensor, ratio, pad_x, pad_y = self._preprocess(image_bgr)
+    def predict_frame(self, frame_bgr: np.ndarray) -> ArcheryAutoAnnotateResult:
+        if frame_bgr is None or frame_bgr.size == 0:
+            raise RuntimeError("Invalid frame data.")
+
+        orig_h, orig_w = frame_bgr.shape[:2]
+        input_tensor, ratio, pad_x, pad_y = self._preprocess(frame_bgr)
         dets, keypoints = self._infer(input_tensor)
 
         boxes, kps = self._normalize_outputs(dets, keypoints)
@@ -82,6 +87,7 @@ class RtmoArcheryAutoAnnotator:
             kp_score = float(selected[idx, 2])
             points.append(
                 {
+                    "id": idx,
                     "name": ARCHERY_KEYPOINTS[idx],
                     "x": round(x, 2),
                     "y": round(y, 2),

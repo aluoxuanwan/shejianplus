@@ -1,3 +1,4 @@
 from archery_plus.ui.widgets.annotation_canvas import AnnotationCanvas
+from archery_plus.ui.widgets.realtime_overlay_widget import RealtimeOverlayWidget
 
-__all__ = ["AnnotationCanvas"]
+__all__ = ["AnnotationCanvas", "RealtimeOverlayWidget"]
