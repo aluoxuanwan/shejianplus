@@ -1,0 +1,2 @@
+﻿frame_idx,video_time_s,wall_time_s,target,keypoint_name,x_px,y_px,x_cm,y_cm,score,src_fps,display_filter,row_kind
+1,0.01,1.23,archery,UP,1,2,,,0.9,60,raw,keypoint

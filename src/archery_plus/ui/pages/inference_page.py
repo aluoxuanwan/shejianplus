@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
 
 from archery_plus.config import BASE_DIR, MODEL_FILES
 from archery_plus.core.ema_filter import ButterworthBidirectionalPointFilter, OneEuroPointFilter
+from archery_plus.core.inference_session_exporter import export_inference_session_timeseries
 from archery_plus.core.keypoint_schema import DEFAULT_ARCHERY_KEYPOINT_NAMES, DEFAULT_HUMAN_KEYPOINT_NAMES
 from archery_plus.core.scale_converter import BowScaleConverter
 from archery_plus.pipelines.auto_annotator_halpe26 import Halpe26AutoAnnotator
@@ -90,6 +91,11 @@ class InferenceWorker(QObject):
         self._init_butterworth(butter_cutoff_hz, sample_hz=30.0, window_seconds=butter_window_seconds)
         self._set_filter_mode(filter_mode)
         self._scale = (
+            BowScaleConverter(bow_length_cm=bow_length_cm, scale_conf_threshold=confidence)
+            if self._target_mode in (TARGET_ARCHERY, TARGET_BOTH)
+            else None
+        )
+        self._scale_raw = (
             BowScaleConverter(bow_length_cm=bow_length_cm, scale_conf_threshold=confidence)
             if self._target_mode in (TARGET_ARCHERY, TARGET_BOTH)
             else None
@@ -173,6 +179,10 @@ class InferenceWorker(QObject):
         for bf in self._butter_filters.values():
             if bf is not None:
                 bf.reset()
+        if self._scale is not None:
+            self._scale.reset()
+        if self._scale_raw is not None:
+            self._scale_raw.reset()
 
     def stop(self) -> None:
         with self._lock:
@@ -273,19 +283,29 @@ class InferenceWorker(QObject):
                 if self._scale is not None:
                     self._scale.set_bow_length_cm(p["bow_length_cm"])
                     self._scale.set_threshold(p["confidence"])
+                if self._scale_raw is not None:
+                    self._scale_raw.set_bow_length_cm(p["bow_length_cm"])
+                    self._scale_raw.set_threshold(p["confidence"])
 
                 all_points: list[dict[str, Any]] = []
+                all_points_raw: list[dict[str, Any]] = []
                 archery_filtered_points: list[dict[str, Any]] = []
+                archery_raw_points: list[dict[str, Any]] = []
                 for tgt in self._enabled_targets():
                     annotator = self._annotators[tgt]
                     annotator.set_thresholds(p["confidence"], p["iou"])
                     result = annotator.predict_frame(frame_bgr)
+                    if tgt == TARGET_ARCHERY:
+                        archery_raw_points = [dict(x) for x in result.points if isinstance(x, dict)]
                     filtered = self._filter_points_for_target(tgt, result.points)
                     if tgt == TARGET_ARCHERY:
                         archery_filtered_points = [dict(x) for x in filtered]
+                    all_points_raw.extend(self._decorate_points_for_display(tgt, result.points))
                     all_points.extend(self._decorate_points_for_display(tgt, filtered))
 
+                cm_per_px_raw = self._scale_raw.update(archery_raw_points) if self._scale_raw is not None else None
                 cm_per_px = self._scale.update(archery_filtered_points) if self._scale is not None else None
+                raw_rows = self._build_rows(all_points_raw, cm_per_px_raw)
                 rows = self._build_rows(all_points, cm_per_px)
 
                 dt = max(time.perf_counter() - t0, 1e-6)
@@ -314,6 +334,7 @@ class InferenceWorker(QObject):
                 payload = {
                     "frame": frame_bgr,
                     "points": all_points,
+                    "raw_rows": raw_rows,
                     "rows": rows,
                     "cm_per_px": cm_per_px,
                     "fps": infer_fps,
@@ -428,6 +449,9 @@ class InferencePage(QWidget):
         self._analysis_history: deque[dict[str, Any]] = deque(maxlen=600)
         self._active_keypoint_names: list[str] = list(KEYPOINT_NAMES)
         self._table_rows_meta: list[dict[str, Any]] = []
+        self._session_raw_rows: list[dict[str, Any]] = []
+        self._session_filtered_rows: list[dict[str, Any]] = []
+        self._session_meta: dict[str, Any] = {}
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -561,19 +585,23 @@ class InferencePage(QWidget):
         self.pause_btn = QPushButton("暂停")
         self.stop_btn = QPushButton("停止")
         self.analysis_btn = QPushButton("参数")
+        self.export_session_btn = QPushButton("导出推理CSV")
 
         self.start_btn.clicked.connect(self._start)
         self.pause_btn.clicked.connect(self._toggle_pause)
         self.stop_btn.clicked.connect(self._stop)
         self.analysis_btn.clicked.connect(self._open_analysis_dialog)
+        self.export_session_btn.clicked.connect(self._export_inference_session_csv)
 
         self.pause_btn.setEnabled(False)
         self.stop_btn.setEnabled(False)
+        self.export_session_btn.setEnabled(False)
 
         control_row.addWidget(self.start_btn)
         control_row.addWidget(self.pause_btn)
         control_row.addWidget(self.stop_btn)
         control_row.addWidget(self.analysis_btn)
+        control_row.addWidget(self.export_session_btn)
 
         self.status_label = QLabel("状态: 未开始")
         control_row.addWidget(self.status_label)
@@ -657,10 +685,26 @@ class InferencePage(QWidget):
         self.monitor.clear()
         self.overlay.clear()
         self._analysis_history.clear()
+        self._session_raw_rows.clear()
+        self._session_filtered_rows.clear()
         self._active_keypoint_names = self._target_keypoint_names(target_mode)
         self._rebuild_table(self._active_keypoint_names)
         for k, v in model_paths.items():
             self._append_log(f"[INFO] 模型路径({k}): {v}")
+        self._session_meta = {
+            "video_path": str(video_path),
+            "target_mode": target_mode,
+            "model_paths": {k: str(v) for k, v in model_paths.items()},
+            "confidence": float(self.conf_spin.value()),
+            "iou": float(self.iou_spin.value()),
+            "filter_mode": self._current_filter_mode(),
+            "one_euro_min_cutoff": float(self.one_euro_min_cutoff_spin.value()),
+            "one_euro_beta": float(self.one_euro_beta_spin.value()),
+            "one_euro_d_cutoff": float(self.one_euro_d_cutoff_spin.value()),
+            "butter_cutoff_hz": float(self.butter_cutoff_hz_spin.value()),
+            "butter_window_seconds": float(self.butter_window_seconds_spin.value()),
+            "bow_length_cm": float(self.bow_length_spin.value()),
+        }
 
         worker = InferenceWorker(
             video_path=video_path,
@@ -700,6 +744,7 @@ class InferencePage(QWidget):
         self.status_label.setText("状态: 运行中")
         self.live_fps_label.setText("推理FPS: -")
         self.video_fps_label.setText("视频FPS: -")
+        self.export_session_btn.setEnabled(False)
 
         thread.start()
 
@@ -850,6 +895,38 @@ class InferencePage(QWidget):
     def _on_analysis_dialog_closed(self, *_args: Any) -> None:
         self._analysis_dialog = None
 
+    def _export_inference_session_csv(self) -> None:
+        if not self._session_raw_rows and not self._session_filtered_rows:
+            QMessageBox.information(self, "提示", "当前没有可导出的推理时序数据。请先完成一次推理。")
+            return
+
+        default_root = BASE_DIR / "output" / "inference_sessions"
+        default_root.mkdir(parents=True, exist_ok=True)
+        selected = QFileDialog.getExistingDirectory(self, "选择推理时序导出目录", str(default_root))
+        if not selected:
+            return
+
+        try:
+            result = export_inference_session_timeseries(
+                export_root=Path(selected),
+                session_meta=dict(self._session_meta),
+                raw_rows=list(self._session_raw_rows),
+                filtered_rows=list(self._session_filtered_rows),
+            )
+        except Exception as exc:
+            self._append_log(f"[ERROR] 推理时序导出失败: {exc}")
+            QMessageBox.critical(self, "导出失败", str(exc))
+            return
+
+        self._append_log(
+            "[INFO] 推理时序导出完成: "
+            f"{result.output_dir} | raw_rows={result.raw_rows}, filtered_rows={result.filtered_rows}"
+        )
+        self._append_log(f"[FILE] {result.raw_csv}")
+        self._append_log(f"[FILE] {result.filtered_csv}")
+        self._append_log(f"[FILE] {result.meta_json}")
+        QMessageBox.information(self, "导出完成", f"推理时序导出成功：\n{result.output_dir}")
+
     def _push_analysis_snapshot(
         self,
         *,
@@ -877,9 +954,87 @@ class InferencePage(QWidget):
         if self._analysis_dialog is not None:
             self._analysis_dialog.set_history(list(self._analysis_history))
 
+    def _append_session_timeseries_rows(
+        self,
+        *,
+        raw_rows: list[dict[str, Any]],
+        filtered_rows: list[dict[str, Any]],
+        frame_idx: int,
+        src_fps: float,
+        wall_time_s: float,
+    ) -> None:
+        video_time_s = (float(frame_idx) / float(src_fps)) if src_fps > 1e-6 else None
+        self._session_raw_rows.extend(
+            self._flatten_timeseries_rows(
+                rows=raw_rows,
+                frame_idx=frame_idx,
+                src_fps=src_fps,
+                wall_time_s=wall_time_s,
+                video_time_s=video_time_s,
+                display_filter="raw",
+            )
+        )
+        self._session_filtered_rows.extend(
+            self._flatten_timeseries_rows(
+                rows=filtered_rows,
+                frame_idx=frame_idx,
+                src_fps=src_fps,
+                wall_time_s=wall_time_s,
+                video_time_s=video_time_s,
+                display_filter="filtered",
+            )
+        )
+
+    def _flatten_timeseries_rows(
+        self,
+        *,
+        rows: list[dict[str, Any]],
+        frame_idx: int,
+        src_fps: float,
+        wall_time_s: float,
+        video_time_s: float | None,
+        display_filter: str,
+    ) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            name = str(row.get("name", "")).strip()
+            if not name:
+                continue
+            target = self._infer_target_from_name(name)
+            out.append(
+                {
+                    "frame_idx": int(frame_idx),
+                    "video_time_s": None if video_time_s is None else round(float(video_time_s), 6),
+                    "wall_time_s": round(float(wall_time_s), 6),
+                    "target": target,
+                    "keypoint_name": name,
+                    "x_px": row.get("x_px"),
+                    "y_px": row.get("y_px"),
+                    "x_cm": row.get("x_cm"),
+                    "y_cm": row.get("y_cm"),
+                    "score": row.get("score"),
+                    "src_fps": round(float(src_fps), 6) if src_fps > 0 else None,
+                    "display_filter": display_filter,
+                    "row_kind": "keypoint",
+                }
+            )
+        return out
+
+    def _infer_target_from_name(self, keypoint_name: str) -> str:
+        name = str(keypoint_name).strip()
+        if name in KEYPOINT_NAMES:
+            return TARGET_ARCHERY
+        if name in HUMAN_KEYPOINT_NAMES:
+            return TARGET_HUMAN
+        return "unknown"
+
     def _on_frame_ready(self, payload: dict[str, Any]) -> None:
+        wall_now = time.perf_counter()
         frame = payload.get("frame")
         points = payload.get("points", [])
+        raw_rows = payload.get("raw_rows", [])
         rows = payload.get("rows", [])
         cm_per_px = payload.get("cm_per_px")
         infer_fps = float(payload.get("fps", 0.0))
@@ -918,6 +1073,13 @@ class InferencePage(QWidget):
         self.video_fps_label.setText(f"视频FPS: {src_fps:.2f}" if src_fps > 0 else "视频FPS: -")
         self._update_table(rows)
         self._push_analysis_snapshot(rows=rows, frame_idx=frame_idx, cm_per_px=cm_per_px, src_fps=src_fps)
+        self._append_session_timeseries_rows(
+            raw_rows=raw_rows if isinstance(raw_rows, list) else [],
+            filtered_rows=rows if isinstance(rows, list) else [],
+            frame_idx=frame_idx,
+            src_fps=src_fps,
+            wall_time_s=wall_now,
+        )
 
     def _update_table(self, rows: list[dict[str, Any]]) -> None:
         row_map = {str(one.get("name", "")).strip().upper(): one for one in rows if isinstance(one, dict)}
@@ -968,6 +1130,7 @@ class InferencePage(QWidget):
         self.status_label.setText("状态: 已结束")
         self.live_fps_label.setText("推理FPS: -")
         self.video_fps_label.setText("视频FPS: -")
+        self.export_session_btn.setEnabled(bool(self._session_raw_rows or self._session_filtered_rows))
         self.start_btn.setEnabled(True)
         self.pause_btn.setEnabled(False)
         self.stop_btn.setEnabled(False)
