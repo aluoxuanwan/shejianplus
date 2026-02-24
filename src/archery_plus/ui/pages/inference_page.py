@@ -1,13 +1,16 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import threading
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any
 
 import cv2
 from PySide6.QtCore import QObject, QThread, Qt, Signal
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
+    QComboBox,
     QFileDialog,
     QDoubleSpinBox,
     QFormLayout,
@@ -26,13 +29,22 @@ from PySide6.QtWidgets import (
 )
 
 from archery_plus.config import BASE_DIR, MODEL_FILES
-from archery_plus.core.ema_filter import EmaPointFilter
-from archery_plus.core.keypoint_schema import DEFAULT_ARCHERY_KEYPOINT_NAMES
+from archery_plus.core.ema_filter import ButterworthBidirectionalPointFilter, OneEuroPointFilter
+from archery_plus.core.keypoint_schema import DEFAULT_ARCHERY_KEYPOINT_NAMES, DEFAULT_HUMAN_KEYPOINT_NAMES
 from archery_plus.core.scale_converter import BowScaleConverter
+from archery_plus.pipelines.auto_annotator_halpe26 import Halpe26AutoAnnotator
 from archery_plus.pipelines.auto_annotator_rtmo_archery import RtmoArcheryAutoAnnotator
+from archery_plus.ui.widgets.inference_analysis_dialog import AnalysisDialog
 from archery_plus.ui.widgets.realtime_overlay_widget import RealtimeOverlayWidget
 
 KEYPOINT_NAMES = list(DEFAULT_ARCHERY_KEYPOINT_NAMES)
+HUMAN_KEYPOINT_NAMES = list(DEFAULT_HUMAN_KEYPOINT_NAMES)
+FILTER_MODE_ONE_EURO = "one_euro"
+FILTER_MODE_BUTTER = "butterworth"
+TARGET_ARCHERY = "archery"
+TARGET_HUMAN = "human"
+TARGET_BOTH = "both"
+
 
 
 class InferenceWorker(QObject):
@@ -44,17 +56,44 @@ class InferenceWorker(QObject):
     def __init__(
         self,
         video_path: Path,
-        model_path: Path,
+        model_paths: dict[str, Path],
+        target_mode: str,
         confidence: float,
         iou: float,
-        ema_alpha: float,
+        smooth_alpha: float,
         bow_length_cm: float,
+        filter_mode: str = FILTER_MODE_ONE_EURO,
+        one_euro_min_cutoff: float = 2.8,
+        one_euro_beta: float = 4.2,
+        one_euro_d_cutoff: float = 1.0,
+        butter_cutoff_hz: float = 3.0,
+        butter_window_seconds: float = 2.0,
     ) -> None:
         super().__init__()
         self._video_path = Path(video_path)
-        self._annotator = RtmoArcheryAutoAnnotator(model_path=model_path)
-        self._ema = EmaPointFilter(alpha=ema_alpha)
-        self._scale = BowScaleConverter(bow_length_cm=bow_length_cm, scale_conf_threshold=confidence)
+        self._target_mode = str(target_mode)
+        self._keypoint_names = self._resolve_keypoint_names(self._target_mode)
+        self._model_paths = {str(k): Path(v) for k, v in model_paths.items()}
+        self._annotators = self._build_annotators(self._model_paths, self._target_mode)
+        self._one_euro_filters: dict[str, OneEuroPointFilter] = {}
+        self._butter_filters: dict[str, ButterworthBidirectionalPointFilter | None] = {}
+        for tgt in self._enabled_targets(self._target_mode):
+            oe = OneEuroPointFilter(alpha=smooth_alpha)
+            oe.set_one_euro_params(
+                min_cutoff=one_euro_min_cutoff,
+                beta=one_euro_beta,
+                d_cutoff=one_euro_d_cutoff,
+            )
+            self._one_euro_filters[tgt] = oe
+            self._butter_filters[tgt] = None
+        self._filter_mode = FILTER_MODE_ONE_EURO
+        self._init_butterworth(butter_cutoff_hz, sample_hz=30.0, window_seconds=butter_window_seconds)
+        self._set_filter_mode(filter_mode)
+        self._scale = (
+            BowScaleConverter(bow_length_cm=bow_length_cm, scale_conf_threshold=confidence)
+            if self._target_mode in (TARGET_ARCHERY, TARGET_BOTH)
+            else None
+        )
 
         self._lock = threading.Lock()
         self._running = True
@@ -62,10 +101,78 @@ class InferenceWorker(QObject):
         self._params = {
             "confidence": float(confidence),
             "iou": float(iou),
-            "ema_alpha": float(ema_alpha),
+            "target_mode": str(target_mode),
+            "smooth_alpha": float(smooth_alpha),
             "bow_length_cm": float(bow_length_cm),
+            "filter_mode": str(filter_mode),
+            "one_euro_min_cutoff": float(one_euro_min_cutoff),
+            "one_euro_beta": float(one_euro_beta),
+            "one_euro_d_cutoff": float(one_euro_d_cutoff),
+            "butter_cutoff_hz": float(butter_cutoff_hz),
+            "butter_window_seconds": float(butter_window_seconds),
         }
         self._last_drop_log_ts = 0.0
+
+    def _resolve_keypoint_names(self, target_mode: str) -> list[str]:
+        mode = str(target_mode)
+        if mode == TARGET_HUMAN:
+            return list(HUMAN_KEYPOINT_NAMES)
+        if mode == TARGET_BOTH:
+            return list(KEYPOINT_NAMES) + list(HUMAN_KEYPOINT_NAMES)
+        return list(KEYPOINT_NAMES)
+
+    def _enabled_targets(self, target_mode: str | None = None) -> list[str]:
+        mode = str(target_mode or self._target_mode)
+        if mode == TARGET_BOTH:
+            return [TARGET_ARCHERY, TARGET_HUMAN]
+        if mode == TARGET_HUMAN:
+            return [TARGET_HUMAN]
+        return [TARGET_ARCHERY]
+
+    def _build_annotators(self, model_paths: dict[str, Path], target_mode: str) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        for tgt in self._enabled_targets(target_mode):
+            model_path = model_paths.get(tgt)
+            if model_path is None:
+                raise RuntimeError(f"缺少推理模型路径: {tgt}")
+            if tgt == TARGET_HUMAN:
+                out[tgt] = Halpe26AutoAnnotator(model_path=model_path)
+            else:
+                out[tgt] = RtmoArcheryAutoAnnotator(model_path=model_path)
+        return out
+
+    def _init_butterworth(self, cutoff_hz: float, sample_hz: float, window_seconds: float) -> None:
+        for tgt in self._enabled_targets():
+            try:
+                butter_filter = self._butter_filters.get(tgt)
+                if butter_filter is None:
+                    butter_filter = ButterworthBidirectionalPointFilter(
+                        cutoff_hz=float(cutoff_hz),
+                        sample_hz=float(sample_hz),
+                        window_seconds=float(window_seconds),
+                    )
+                    self._butter_filters[tgt] = butter_filter
+                else:
+                    butter_filter.set_cutoff_hz(float(cutoff_hz))
+                    butter_filter.set_sample_hz(float(sample_hz))
+                    butter_filter.set_window_seconds(float(window_seconds))
+            except Exception as exc:
+                self._butter_filters[tgt] = None
+                self.logMessage.emit(f"[WARN] 巴特沃斯滤波不可用({tgt})，已回退 One Euro: {exc}")
+
+    def _set_filter_mode(self, mode: str) -> None:
+        mode_text = str(mode).strip().lower()
+        if mode_text == FILTER_MODE_BUTTER and any(self._butter_filters.get(t) is not None for t in self._enabled_targets()):
+            self._filter_mode = FILTER_MODE_BUTTER
+        else:
+            self._filter_mode = FILTER_MODE_ONE_EURO
+
+    def _reset_filters(self) -> None:
+        for oe in self._one_euro_filters.values():
+            oe.reset()
+        for bf in self._butter_filters.values():
+            if bf is not None:
+                bf.reset()
 
     def stop(self) -> None:
         with self._lock:
@@ -79,12 +186,31 @@ class InferenceWorker(QObject):
         with self._lock:
             self._paused = False
 
-    def update_params(self, confidence: float, iou: float, ema_alpha: float, bow_length_cm: float) -> None:
+    def update_params(
+        self,
+        confidence: float,
+        iou: float,
+        smooth_alpha: float,
+        bow_length_cm: float,
+        filter_mode: str,
+        one_euro_min_cutoff: float,
+        one_euro_beta: float,
+        one_euro_d_cutoff: float,
+        butter_cutoff_hz: float,
+        butter_window_seconds: float,
+    ) -> None:
         with self._lock:
             self._params["confidence"] = float(confidence)
             self._params["iou"] = float(iou)
-            self._params["ema_alpha"] = float(ema_alpha)
+            # Target/model is fixed during one worker run.
+            self._params["smooth_alpha"] = float(smooth_alpha)
             self._params["bow_length_cm"] = float(bow_length_cm)
+            self._params["filter_mode"] = str(filter_mode)
+            self._params["one_euro_min_cutoff"] = float(one_euro_min_cutoff)
+            self._params["one_euro_beta"] = float(one_euro_beta)
+            self._params["one_euro_d_cutoff"] = float(one_euro_d_cutoff)
+            self._params["butter_cutoff_hz"] = float(butter_cutoff_hz)
+            self._params["butter_window_seconds"] = float(butter_window_seconds)
 
     def run(self) -> None:
         cap: cv2.VideoCapture | None = None
@@ -93,13 +219,21 @@ class InferenceWorker(QObject):
             if not cap.isOpened():
                 raise RuntimeError(f"无法打开视频文件: {self._video_path}")
 
-            if not self._annotator.is_ready():
-                raise RuntimeError("RTMO ONNX 模型不可用，请检查模型文件。")
+            for tgt, annotator in self._annotators.items():
+                if not annotator.is_ready():
+                    model_desc = "RTMPose(HALPE26)" if tgt == TARGET_HUMAN else "RTMO(弓箭)"
+                    raise RuntimeError(f"{model_desc} ONNX 模型不可用，请检查模型文件。")
 
             src_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
             if src_fps <= 1e-6:
                 src_fps = 25.0
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            self._init_butterworth(
+                self._params["butter_cutoff_hz"],
+                sample_hz=src_fps,
+                window_seconds=self._params["butter_window_seconds"],
+            )
+            self._reset_filters()
 
             self.logMessage.emit(f"[INFO] 开始推理: {self._video_path}")
             self.logMessage.emit(f"[INFO] 视频FPS={src_fps:.2f}, 总帧数={total_frames}")
@@ -123,15 +257,36 @@ class InferenceWorker(QObject):
                     self.logMessage.emit("[INFO] 视频播放结束。")
                     break
 
-                self._annotator.set_thresholds(p["confidence"], p["iou"])
-                self._ema.set_alpha(p["ema_alpha"])
-                self._scale.set_bow_length_cm(p["bow_length_cm"])
-                self._scale.set_threshold(p["confidence"])
+                for oe in self._one_euro_filters.values():
+                    oe.set_alpha(p["smooth_alpha"])
+                    oe.set_one_euro_params(
+                        min_cutoff=p["one_euro_min_cutoff"],
+                        beta=p["one_euro_beta"],
+                        d_cutoff=p["one_euro_d_cutoff"],
+                    )
+                self._init_butterworth(
+                    p["butter_cutoff_hz"],
+                    sample_hz=src_fps,
+                    window_seconds=p["butter_window_seconds"],
+                )
+                self._set_filter_mode(str(p["filter_mode"]))
+                if self._scale is not None:
+                    self._scale.set_bow_length_cm(p["bow_length_cm"])
+                    self._scale.set_threshold(p["confidence"])
 
-                result = self._annotator.predict_frame(frame_bgr)
-                filtered_points = self._ema.update(result.points)
-                cm_per_px = self._scale.update(filtered_points)
-                rows = self._build_rows(filtered_points, cm_per_px)
+                all_points: list[dict[str, Any]] = []
+                archery_filtered_points: list[dict[str, Any]] = []
+                for tgt in self._enabled_targets():
+                    annotator = self._annotators[tgt]
+                    annotator.set_thresholds(p["confidence"], p["iou"])
+                    result = annotator.predict_frame(frame_bgr)
+                    filtered = self._filter_points_for_target(tgt, result.points)
+                    if tgt == TARGET_ARCHERY:
+                        archery_filtered_points = [dict(x) for x in filtered]
+                    all_points.extend(self._decorate_points_for_display(tgt, filtered))
+
+                cm_per_px = self._scale.update(archery_filtered_points) if self._scale is not None else None
+                rows = self._build_rows(all_points, cm_per_px)
 
                 dt = max(time.perf_counter() - t0, 1e-6)
                 infer_fps = 1.0 / dt
@@ -158,13 +313,17 @@ class InferenceWorker(QObject):
 
                 payload = {
                     "frame": frame_bgr,
-                    "points": filtered_points,
+                    "points": all_points,
                     "rows": rows,
                     "cm_per_px": cm_per_px,
                     "fps": infer_fps,
                     "frame_idx": frame_idx,
                     "total_frames": total_frames,
                     "dropped": dropped,
+                    "filter_mode": self._filter_mode,
+                    "src_fps": src_fps,
+                    "target_mode": self._target_mode,
+                    "keypoint_names": list(self._keypoint_names),
                 }
                 self.frameReady.emit(payload)
 
@@ -177,7 +336,7 @@ class InferenceWorker(QObject):
 
     def _build_rows(self, points: list[dict[str, Any]], cm_per_px: float | None) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
-        for idx, name in enumerate(KEYPOINT_NAMES):
+        for idx, name in enumerate(self._keypoint_names):
             point = self._pick_point(points, idx, name)
             if point is None:
                 rows.append(
@@ -233,6 +392,31 @@ class InferenceWorker(QObject):
                 return p
         return None
 
+    def _filter_points_for_target(self, target: str, points: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if self._filter_mode == FILTER_MODE_BUTTER:
+            bf = self._butter_filters.get(target)
+            if bf is not None:
+                return bf.update(points)
+        oe = self._one_euro_filters.get(target)
+        if oe is None:
+            return [dict(p) for p in points if isinstance(p, dict)]
+        return oe.update(points)
+
+    def _decorate_points_for_display(self, target: str, points: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        id_offset = 1000 if (self._target_mode == TARGET_BOTH and target == TARGET_HUMAN) else 0
+        for p in points:
+            if not isinstance(p, dict):
+                continue
+            one = dict(p)
+            one["_target"] = str(target)
+            try:
+                one["id"] = int(one.get("id", -1)) + id_offset
+            except Exception:
+                pass
+            out.append(one)
+        return out
+
 
 class InferencePage(QWidget):
     def __init__(self) -> None:
@@ -240,12 +424,18 @@ class InferencePage(QWidget):
         self._thread: QThread | None = None
         self._worker: InferenceWorker | None = None
         self._paused = False
+        self._analysis_dialog: AnalysisDialog | None = None
+        self._analysis_history: deque[dict[str, Any]] = deque(maxlen=600)
+        self._active_keypoint_names: list[str] = list(KEYPOINT_NAMES)
+        self._table_rows_meta: list[dict[str, Any]] = []
         self._build_ui()
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
 
-        desc = QLabel("应用模块 v1.0：视频实时推理（RTMO）+ EMA平滑 + 弓长单位换算（px->cm）。")
+        desc = QLabel(
+            "应用模块 v1.0：视频实时推理（RTMO）+ One Euro/巴特沃斯滤波 + 弓长单位换算（px->cm）。"
+        )
         desc.setWordWrap(True)
         root.addWidget(desc)
 
@@ -272,13 +462,81 @@ class InferencePage(QWidget):
         params_row.addWidget(QLabel("登记弓长"))
         params_row.addWidget(self.bow_length_spin)
 
+        self.target_combo = QComboBox()
+        self.target_combo.addItem("弓箭关键点（RTMO）", TARGET_ARCHERY)
+        self.target_combo.addItem("人体关键点（RTMPose-HALPE26）", TARGET_HUMAN)
+        self.target_combo.addItem("双模型（弓箭+人体）", TARGET_BOTH)
+        self.target_combo.currentIndexChanged.connect(self._on_target_changed)
+        params_row.addWidget(QLabel("推理目标"))
+        params_row.addWidget(self.target_combo)
+
+        self.filter_mode_combo = QComboBox()
+        self.filter_mode_combo.addItem("One Euro（一欧元滤波）", FILTER_MODE_ONE_EURO)
+        self.filter_mode_combo.addItem("双向四阶巴特沃斯", FILTER_MODE_BUTTER)
+        self.filter_mode_combo.currentIndexChanged.connect(self._on_runtime_params_changed)
+        params_row.addWidget(QLabel("滤波方式"))
+        params_row.addWidget(self.filter_mode_combo)
+
         self.ema_alpha_spin = QDoubleSpinBox()
         self.ema_alpha_spin.setRange(0.0, 1.0)
         self.ema_alpha_spin.setSingleStep(0.05)
         self.ema_alpha_spin.setValue(0.70)
+        self.ema_alpha_spin.setToolTip("平滑强度语义：越大越跟手、越小越平滑。")
         self.ema_alpha_spin.valueChanged.connect(self._on_runtime_params_changed)
-        params_row.addWidget(QLabel("EMA"))
+        params_row.addWidget(QLabel("平滑"))
         params_row.addWidget(self.ema_alpha_spin)
+
+        self.one_euro_min_cutoff_spin = QDoubleSpinBox()
+        self.one_euro_min_cutoff_spin.setRange(0.01, 20.0)
+        self.one_euro_min_cutoff_spin.setDecimals(2)
+        self.one_euro_min_cutoff_spin.setSingleStep(0.1)
+        self.one_euro_min_cutoff_spin.setValue(2.8)
+        self.one_euro_min_cutoff_spin.setToolTip("One Euro 最小截止频率，越小越平滑。")
+        self.one_euro_min_cutoff_spin.valueChanged.connect(self._on_runtime_params_changed)
+        params_row.addWidget(QLabel("min_cutoff"))
+        params_row.addWidget(self.one_euro_min_cutoff_spin)
+
+        self.one_euro_beta_spin = QDoubleSpinBox()
+        self.one_euro_beta_spin.setRange(0.0, 30.0)
+        self.one_euro_beta_spin.setDecimals(2)
+        self.one_euro_beta_spin.setSingleStep(0.2)
+        self.one_euro_beta_spin.setValue(4.2)
+        self.one_euro_beta_spin.setToolTip("One Euro 速度响应系数，越大动态越跟手。")
+        self.one_euro_beta_spin.valueChanged.connect(self._on_runtime_params_changed)
+        params_row.addWidget(QLabel("beta"))
+        params_row.addWidget(self.one_euro_beta_spin)
+
+        self.one_euro_d_cutoff_spin = QDoubleSpinBox()
+        self.one_euro_d_cutoff_spin.setRange(0.01, 20.0)
+        self.one_euro_d_cutoff_spin.setDecimals(2)
+        self.one_euro_d_cutoff_spin.setSingleStep(0.1)
+        self.one_euro_d_cutoff_spin.setValue(1.0)
+        self.one_euro_d_cutoff_spin.setToolTip("One Euro 导数低通截止频率。")
+        self.one_euro_d_cutoff_spin.valueChanged.connect(self._on_runtime_params_changed)
+        params_row.addWidget(QLabel("d_cutoff"))
+        params_row.addWidget(self.one_euro_d_cutoff_spin)
+
+        self.butter_cutoff_hz_spin = QDoubleSpinBox()
+        self.butter_cutoff_hz_spin.setRange(0.05, 20.0)
+        self.butter_cutoff_hz_spin.setDecimals(2)
+        self.butter_cutoff_hz_spin.setSingleStep(0.1)
+        self.butter_cutoff_hz_spin.setValue(3.0)
+        self.butter_cutoff_hz_spin.setSuffix(" Hz")
+        self.butter_cutoff_hz_spin.setToolTip("双向四阶巴特沃斯低通截止频率。")
+        self.butter_cutoff_hz_spin.valueChanged.connect(self._on_runtime_params_changed)
+        params_row.addWidget(QLabel("巴特沃斯Hz"))
+        params_row.addWidget(self.butter_cutoff_hz_spin)
+
+        self.butter_window_seconds_spin = QDoubleSpinBox()
+        self.butter_window_seconds_spin.setRange(0.3, 10.0)
+        self.butter_window_seconds_spin.setDecimals(2)
+        self.butter_window_seconds_spin.setSingleStep(0.1)
+        self.butter_window_seconds_spin.setValue(2.0)
+        self.butter_window_seconds_spin.setSuffix(" s")
+        self.butter_window_seconds_spin.setToolTip("双向巴特沃斯滚动窗口长度（秒），越大越稳但边界效应更明显。")
+        self.butter_window_seconds_spin.valueChanged.connect(self._on_runtime_params_changed)
+        params_row.addWidget(QLabel("巴特沃斯窗长"))
+        params_row.addWidget(self.butter_window_seconds_spin)
 
         self.conf_spin = QDoubleSpinBox()
         self.conf_spin.setRange(0.0, 1.0)
@@ -302,10 +560,12 @@ class InferencePage(QWidget):
         self.start_btn = QPushButton("开始")
         self.pause_btn = QPushButton("暂停")
         self.stop_btn = QPushButton("停止")
+        self.analysis_btn = QPushButton("参数")
 
         self.start_btn.clicked.connect(self._start)
         self.pause_btn.clicked.connect(self._toggle_pause)
         self.stop_btn.clicked.connect(self._stop)
+        self.analysis_btn.clicked.connect(self._open_analysis_dialog)
 
         self.pause_btn.setEnabled(False)
         self.stop_btn.setEnabled(False)
@@ -313,9 +573,14 @@ class InferencePage(QWidget):
         control_row.addWidget(self.start_btn)
         control_row.addWidget(self.pause_btn)
         control_row.addWidget(self.stop_btn)
+        control_row.addWidget(self.analysis_btn)
 
         self.status_label = QLabel("状态: 未开始")
         control_row.addWidget(self.status_label)
+        self.live_fps_label = QLabel("推理FPS: -")
+        self.video_fps_label = QLabel("视频FPS: -")
+        control_row.addWidget(self.live_fps_label)
+        control_row.addWidget(self.video_fps_label)
         control_row.addStretch(1)
 
         top_form.addRow("视频文件", video_row)
@@ -334,15 +599,12 @@ class InferencePage(QWidget):
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
 
-        self.table = QTableWidget(len(KEYPOINT_NAMES), 6)
+        self.table = QTableWidget(0, 6)
         self.table.setHorizontalHeaderLabels(["关键点", "x_px", "y_px", "x_cm", "y_cm", "score"])
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
-        for r, name in enumerate(KEYPOINT_NAMES):
-            self.table.setItem(r, 0, QTableWidgetItem(name))
-            for c in range(1, 6):
-                self.table.setItem(r, c, QTableWidgetItem("-"))
+        self._rebuild_table(self._active_keypoint_names)
         right_layout.addWidget(self.table, stretch=1)
 
         self.monitor = QTextEdit()
@@ -357,6 +619,8 @@ class InferencePage(QWidget):
         bottom_splitter.setSizes([1120, 480])
 
         root.addWidget(bottom_splitter, stretch=1)
+        self._refresh_filter_param_enable_state()
+        self._refresh_target_ui_state()
 
     def _choose_video(self) -> None:
         selected, _ = QFileDialog.getOpenFileName(
@@ -383,22 +647,35 @@ class InferencePage(QWidget):
             QMessageBox.warning(self, "提示", f"视频文件不存在: {video_path}")
             return
 
-        model_path = BASE_DIR / MODEL_FILES["archery_keypoints_onnx"]
-        if not model_path.exists():
-            QMessageBox.warning(self, "提示", f"RTMO ONNX 不存在: {model_path}")
+        target_mode = self._current_target_mode()
+        model_paths = self._target_model_paths(target_mode)
+        missing = [f"{k}:{v}" for k, v in model_paths.items() if not Path(v).exists()]
+        if missing:
+            QMessageBox.warning(self, "提示", "以下模型文件不存在:\n" + "\n".join(missing))
             return
 
         self.monitor.clear()
         self.overlay.clear()
-        self._append_log(f"[INFO] 模型路径: {model_path}")
+        self._analysis_history.clear()
+        self._active_keypoint_names = self._target_keypoint_names(target_mode)
+        self._rebuild_table(self._active_keypoint_names)
+        for k, v in model_paths.items():
+            self._append_log(f"[INFO] 模型路径({k}): {v}")
 
         worker = InferenceWorker(
             video_path=video_path,
-            model_path=model_path,
+            model_paths=model_paths,
+            target_mode=target_mode,
             confidence=float(self.conf_spin.value()),
             iou=float(self.iou_spin.value()),
-            ema_alpha=float(self.ema_alpha_spin.value()),
+            smooth_alpha=float(self.ema_alpha_spin.value()),
             bow_length_cm=float(self.bow_length_spin.value()),
+            filter_mode=self._current_filter_mode(),
+            one_euro_min_cutoff=float(self.one_euro_min_cutoff_spin.value()),
+            one_euro_beta=float(self.one_euro_beta_spin.value()),
+            one_euro_d_cutoff=float(self.one_euro_d_cutoff_spin.value()),
+            butter_cutoff_hz=float(self.butter_cutoff_hz_spin.value()),
+            butter_window_seconds=float(self.butter_window_seconds_spin.value()),
         )
         thread = QThread(self)
         worker.moveToThread(thread)
@@ -421,6 +698,8 @@ class InferencePage(QWidget):
         self.stop_btn.setEnabled(True)
         self.pause_btn.setText("暂停")
         self.status_label.setText("状态: 运行中")
+        self.live_fps_label.setText("推理FPS: -")
+        self.video_fps_label.setText("视频FPS: -")
 
         thread.start()
 
@@ -449,15 +728,154 @@ class InferencePage(QWidget):
         self.pause_btn.setEnabled(False)
         self.stop_btn.setEnabled(False)
 
+    def _current_target_mode(self) -> str:
+        data = self.target_combo.currentData()
+        if isinstance(data, str) and data:
+            return data
+        return TARGET_ARCHERY
+
+    def _target_model_paths(self, target_mode: str) -> dict[str, Path]:
+        mode = str(target_mode)
+        if mode == TARGET_HUMAN:
+            return {TARGET_HUMAN: BASE_DIR / MODEL_FILES["human_halpe26_onnx"]}
+        if mode == TARGET_BOTH:
+            return {
+                TARGET_ARCHERY: BASE_DIR / MODEL_FILES["archery_keypoints_onnx"],
+                TARGET_HUMAN: BASE_DIR / MODEL_FILES["human_halpe26_onnx"],
+            }
+        return {TARGET_ARCHERY: BASE_DIR / MODEL_FILES["archery_keypoints_onnx"]}
+
+    def _target_keypoint_names(self, target_mode: str) -> list[str]:
+        mode = str(target_mode)
+        if mode == TARGET_HUMAN:
+            return list(HUMAN_KEYPOINT_NAMES)
+        if mode == TARGET_BOTH:
+            return list(KEYPOINT_NAMES) + list(HUMAN_KEYPOINT_NAMES)
+        return list(KEYPOINT_NAMES)
+
+    def _refresh_target_ui_state(self) -> None:
+        is_archery = self._current_target_mode() in (TARGET_ARCHERY, TARGET_BOTH)
+        self.bow_length_spin.setEnabled(is_archery)
+        self.bow_length_spin.setToolTip("" if is_archery else "人体关键点模式下不进行弓长像素-厘米换算。")
+
+    def _on_target_changed(self) -> None:
+        if self._worker is not None:
+            self._append_log("[INFO] 推理运行中，推理目标切换将在下次开始时生效。")
+        self._refresh_target_ui_state()
+        self._active_keypoint_names = self._target_keypoint_names(self._current_target_mode())
+        self._rebuild_table(self._active_keypoint_names)
+        if self._analysis_dialog is not None:
+            self._analysis_dialog.close()
+
+    def _rebuild_table(self, keypoint_names: list[str]) -> None:
+        names = [str(x) for x in keypoint_names]
+        mode = self._current_target_mode()
+        rows_meta: list[dict[str, Any]] = []
+        if mode == TARGET_BOTH:
+            rows_meta.append({"kind": "header", "title": "弓箭关键点"})
+            for name in KEYPOINT_NAMES:
+                if name in names:
+                    rows_meta.append({"kind": "kp", "name": str(name)})
+            rows_meta.append({"kind": "header", "title": "人体关键点"})
+            for name in HUMAN_KEYPOINT_NAMES:
+                if name in names:
+                    rows_meta.append({"kind": "kp", "name": str(name)})
+        else:
+            rows_meta = [{"kind": "kp", "name": str(name)} for name in names]
+
+        self._table_rows_meta = rows_meta
+        self.table.setRowCount(len(rows_meta))
+        for r, meta in enumerate(rows_meta):
+            item0 = self.table.item(r, 0)
+            if item0 is None:
+                item0 = QTableWidgetItem()
+                self.table.setItem(r, 0, item0)
+            if meta.get("kind") == "header":
+                item0.setText(f"—— {meta.get('title', '')} ——")
+                item0.setBackground(QColor(236, 240, 245))
+            else:
+                item0.setText(str(meta.get("name", "")))
+                item0.setBackground(QColor(255, 255, 255))
+            for c in range(1, 6):
+                item = self.table.item(r, c)
+                if item is None:
+                    item = QTableWidgetItem()
+                    self.table.setItem(r, c, item)
+                item.setText("" if meta.get("kind") == "header" else "-")
+                item.setBackground(QColor(236, 240, 245) if meta.get("kind") == "header" else QColor(255, 255, 255))
+
+    def _current_filter_mode(self) -> str:
+        data = self.filter_mode_combo.currentData()
+        if isinstance(data, str) and data:
+            return data
+        return FILTER_MODE_ONE_EURO
+
+    def _refresh_filter_param_enable_state(self) -> None:
+        is_one_euro = self._current_filter_mode() == FILTER_MODE_ONE_EURO
+        self.one_euro_min_cutoff_spin.setEnabled(is_one_euro)
+        self.one_euro_beta_spin.setEnabled(is_one_euro)
+        self.one_euro_d_cutoff_spin.setEnabled(is_one_euro)
+        self.butter_cutoff_hz_spin.setEnabled(not is_one_euro)
+        self.butter_window_seconds_spin.setEnabled(not is_one_euro)
+
     def _on_runtime_params_changed(self) -> None:
+        self._refresh_filter_param_enable_state()
+        self._refresh_target_ui_state()
         if self._worker is None:
             return
         self._worker.update_params(
             confidence=float(self.conf_spin.value()),
             iou=float(self.iou_spin.value()),
-            ema_alpha=float(self.ema_alpha_spin.value()),
+            smooth_alpha=float(self.ema_alpha_spin.value()),
             bow_length_cm=float(self.bow_length_spin.value()),
+            filter_mode=self._current_filter_mode(),
+            one_euro_min_cutoff=float(self.one_euro_min_cutoff_spin.value()),
+            one_euro_beta=float(self.one_euro_beta_spin.value()),
+            one_euro_d_cutoff=float(self.one_euro_d_cutoff_spin.value()),
+            butter_cutoff_hz=float(self.butter_cutoff_hz_spin.value()),
+            butter_window_seconds=float(self.butter_window_seconds_spin.value()),
         )
+
+    def _open_analysis_dialog(self) -> None:
+        if self._analysis_dialog is None or self._analysis_dialog.keypoint_names() != self._active_keypoint_names:
+            if self._analysis_dialog is not None:
+                self._analysis_dialog.close()
+            self._analysis_dialog = AnalysisDialog(self._active_keypoint_names, self)
+            self._analysis_dialog.finished.connect(self._on_analysis_dialog_closed)
+        self._analysis_dialog.set_history(list(self._analysis_history))
+        self._analysis_dialog.show()
+        self._analysis_dialog.raise_()
+        self._analysis_dialog.activateWindow()
+
+    def _on_analysis_dialog_closed(self, *_args: Any) -> None:
+        self._analysis_dialog = None
+
+    def _push_analysis_snapshot(
+        self,
+        *,
+        rows: list[dict[str, Any]],
+        frame_idx: int,
+        cm_per_px: float | None,
+        src_fps: float | None,
+    ) -> None:
+        row_map = {}
+        for one in rows:
+            if not isinstance(one, dict):
+                continue
+            key = str(one.get("name", "")).strip().upper()
+            if key:
+                row_map[key] = dict(one)
+        self._analysis_history.append(
+            {
+                "ts": time.perf_counter(),
+                "frame_idx": int(frame_idx),
+                "cm_per_px": None if cm_per_px is None else float(cm_per_px),
+                "src_fps": None if src_fps is None else float(src_fps),
+                "row_map": row_map,
+            }
+        )
+        if self._analysis_dialog is not None:
+            self._analysis_dialog.set_history(list(self._analysis_history))
 
     def _on_frame_ready(self, payload: dict[str, Any]) -> None:
         frame = payload.get("frame")
@@ -468,21 +886,52 @@ class InferencePage(QWidget):
         frame_idx = int(payload.get("frame_idx", 0))
         total = int(payload.get("total_frames", 0))
         dropped = int(payload.get("dropped", 0))
+        filter_mode = str(payload.get("filter_mode", self._current_filter_mode()))
+        src_fps = float(payload.get("src_fps", 0.0) or 0.0)
+        target_mode = str(payload.get("target_mode", self._current_target_mode()))
+        payload_kps = payload.get("keypoint_names")
+        if isinstance(payload_kps, list):
+            names = [str(x) for x in payload_kps]
+            if names and names != self._active_keypoint_names:
+                self._active_keypoint_names = names
+                self._rebuild_table(self._active_keypoint_names)
 
         if frame is not None:
             self.overlay.set_frame(frame, points)
 
         scale_text = "-" if cm_per_px is None else f"{float(cm_per_px):.4f}cm"
-        status = f"FPS:{infer_fps:.1f} | 1px={scale_text} | 进度:{frame_idx}/{max(total, 0)} | 丢帧:{dropped}"
+        filter_name = "One Euro" if filter_mode == FILTER_MODE_ONE_EURO else "Butterworth"
+        if target_mode == TARGET_HUMAN:
+            target_name = "人体"
+        elif target_mode == TARGET_BOTH:
+            target_name = "双模型"
+        else:
+            target_name = "弓箭"
+        status = (
+            f"目标:{target_name} | FPS:{infer_fps:.1f} | 1px={scale_text} | 滤波:{filter_name} | "
+            f"进度:{frame_idx}/{max(total, 0)} | 丢帧:{dropped}"
+        )
         self.overlay.set_overlay_status(status)
 
         self.status_label.setText(f"状态: 运行中 | {status}")
+        self.live_fps_label.setText(f"推理FPS: {infer_fps:.1f}")
+        self.video_fps_label.setText(f"视频FPS: {src_fps:.2f}" if src_fps > 0 else "视频FPS: -")
         self._update_table(rows)
+        self._push_analysis_snapshot(rows=rows, frame_idx=frame_idx, cm_per_px=cm_per_px, src_fps=src_fps)
 
     def _update_table(self, rows: list[dict[str, Any]]) -> None:
         row_map = {str(one.get("name", "")).strip().upper(): one for one in rows if isinstance(one, dict)}
 
-        for r, name in enumerate(KEYPOINT_NAMES):
+        for r, meta in enumerate(self._table_rows_meta):
+            if meta.get("kind") == "header":
+                for c in range(1, 6):
+                    item = self.table.item(r, c)
+                    if item is None:
+                        item = QTableWidgetItem()
+                        self.table.setItem(r, c, item)
+                    item.setText("")
+                continue
+            name = str(meta.get("name", ""))
             one = row_map.get(name.strip().upper())
             if one is None:
                 vals = ["-", "-", "-", "-", "-"]
@@ -517,6 +966,8 @@ class InferencePage(QWidget):
     def _on_worker_finished(self) -> None:
         self._append_log("[INFO] 推理任务结束。")
         self.status_label.setText("状态: 已结束")
+        self.live_fps_label.setText("推理FPS: -")
+        self.video_fps_label.setText("视频FPS: -")
         self.start_btn.setEnabled(True)
         self.pause_btn.setEnabled(False)
         self.stop_btn.setEnabled(False)

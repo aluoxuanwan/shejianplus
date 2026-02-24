@@ -27,6 +27,11 @@
 - 填充训练命令并启动训练
 - 实时日志、loss/precision 曲线、训练状态（含 ETA）
 
+4. 模块4 应用模型（Beta）
+- 视频文件实时推理（RTMO 弓箭关键点）
+- 单位换算（px -> cm）
+- 实时平滑滤波：仅保留 `One Euro`（已移除 EMA/Kalman 选项）
+
 ## 2. 环境准备（uv）
 
 以下命令在 PowerShell 中执行，项目目录以 `D:\work\shejianplus` 为例。

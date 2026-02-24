@@ -84,15 +84,14 @@ class RealtimeOverlayWidget(QWidget):
         iw = float(max(self._qimage.width(), 1))
         ih = float(max(self._qimage.height(), 1))
 
-        ring_color = QColor(255, 176, 59)
-        fill_color = QColor(255, 140, 48)
-
         for point in self._points:
             try:
                 x = float(point.get("x", 0.0))
                 y = float(point.get("y", 0.0))
             except Exception:
                 continue
+            target = str(point.get("_target", "")).strip().lower()
+            ring_color, fill_color = self._point_palette(target)
 
             px = image_rect.x() + (x / iw) * image_rect.width()
             py = image_rect.y() + (y / ih) * image_rect.height()
@@ -107,10 +106,15 @@ class RealtimeOverlayWidget(QWidget):
             painter.drawEllipse(center, 4.0, 4.0)
 
             name = str(point.get("name", "")).strip().upper()
-            if name in self._highlight_names:
-                self._draw_label_chip(painter, px + 6.0, py - 8.0, name)
+            if target == "archery" and name in self._highlight_names:
+                self._draw_label_chip(painter, px + 6.0, py - 8.0, name, accent=ring_color)
 
-    def _draw_label_chip(self, painter: QPainter, x: float, y: float, text: str) -> None:
+    def _point_palette(self, target: str) -> tuple[QColor, QColor]:
+        if target == "human":
+            return QColor(92, 219, 255), QColor(32, 173, 235)
+        return QColor(255, 176, 59), QColor(255, 140, 48)
+
+    def _draw_label_chip(self, painter: QPainter, x: float, y: float, text: str, accent: QColor | None = None) -> None:
         font = QFont(painter.font())
         font.setPointSize(9)
         painter.setFont(font)
@@ -122,7 +126,7 @@ class RealtimeOverlayWidget(QWidget):
         text_h = fm.height()
 
         rect = QRectF(x, y - text_h, text_w + pad_x * 2, text_h + pad_y * 2)
-        painter.setPen(QPen(QColor(255, 176, 59), 1.0))
+        painter.setPen(QPen(accent or QColor(255, 176, 59), 1.0))
         painter.setBrush(QColor(16, 18, 22, 190))
         painter.drawRoundedRect(rect, 4, 4)
 

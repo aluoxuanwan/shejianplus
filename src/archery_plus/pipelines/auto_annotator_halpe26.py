@@ -47,9 +47,14 @@ class Halpe26AutoAnnotator:
         image_bgr = cv2.imread(str(image_path))
         if image_bgr is None:
             raise RuntimeError(f"Cannot read image: {image_path}")
+        return self.predict_frame(image_bgr)
 
-        orig_h, orig_w = image_bgr.shape[:2]
-        input_tensor = self._preprocess(image_bgr)
+    def predict_frame(self, frame_bgr: np.ndarray) -> AutoAnnotateResult:
+        if frame_bgr is None or frame_bgr.size == 0:
+            raise RuntimeError("Invalid frame data.")
+
+        orig_h, orig_w = frame_bgr.shape[:2]
+        input_tensor = self._preprocess(frame_bgr)
         simcc_x, simcc_y = self._infer(input_tensor)
         points = self._decode_to_points(simcc_x, simcc_y, orig_w=orig_w, orig_h=orig_h)
 
