@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
 
 from archery_plus.config import BASE_DIR, MODEL_FILES
 from archery_plus.core.ema_filter import ButterworthBidirectionalPointFilter, OneEuroPointFilter
+from archery_plus.core.inference_session_cache import set_inference_session_snapshot
 from archery_plus.core.inference_session_exporter import export_inference_session_timeseries
 from archery_plus.core.keypoint_schema import DEFAULT_ARCHERY_KEYPOINT_NAMES, DEFAULT_HUMAN_KEYPOINT_NAMES
 from archery_plus.core.scale_converter import BowScaleConverter
@@ -705,6 +706,7 @@ class InferencePage(QWidget):
             "butter_window_seconds": float(self.butter_window_seconds_spin.value()),
             "bow_length_cm": float(self.bow_length_spin.value()),
         }
+        set_inference_session_snapshot(raw_rows=[], filtered_rows=[], meta=dict(self._session_meta))
 
         worker = InferenceWorker(
             video_path=video_path,
@@ -1131,6 +1133,12 @@ class InferencePage(QWidget):
         self.live_fps_label.setText("推理FPS: -")
         self.video_fps_label.setText("视频FPS: -")
         self.export_session_btn.setEnabled(bool(self._session_raw_rows or self._session_filtered_rows))
+        if self._session_raw_rows or self._session_filtered_rows:
+            set_inference_session_snapshot(
+                raw_rows=list(self._session_raw_rows),
+                filtered_rows=list(self._session_filtered_rows),
+                meta=dict(self._session_meta),
+            )
         self.start_btn.setEnabled(True)
         self.pause_btn.setEnabled(False)
         self.stop_btn.setEnabled(False)

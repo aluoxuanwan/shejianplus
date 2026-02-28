@@ -28,9 +28,28 @@
 - 实时日志、loss/precision 曲线、训练状态（含 ETA）
 
 4. 模块4 应用模型（Beta）
-- 视频文件实时推理（RTMO 弓箭关键点）
-- 单位换算（px -> cm）
-- 实时平滑滤波：仅保留 `One Euro`（已移除 EMA/Kalman 选项）
+- 视频文件实时推理（RTMO 弓箭关键点 / RTMPose-HALPE26 人体关键点）
+- 支持双模型同时推理（弓箭 + 人体）
+- 单位换算（px -> cm，弓箭 UP/DOWN 标尺）
+- 实时平滑滤波：
+  - `One Euro`（一欧元滤波器）
+  - 双向四阶巴特沃斯（滚动窗口近实时）
+- 参数分析面板：速度、轨迹、两点/三点/四点角度
+- 实时帧数显示：`推理FPS` 与 `视频FPS`
+- 应用内支持导出“推理时序 CSV”（raw/filter）
+
+5. 模块5 导出数据（v0.2）
+- 标注数据导出：
+  - `raw_2d.csv`
+  - `filtered_2d.csv`（v0.1 占位导出，标记 `filter_method`）
+  - `bbox_2d.csv`
+  - `annotations_export.json`
+  - `label_schema_export.json`
+- 推理时序导出（导出模块内统一入口）：
+  - `raw_2d_timeseries.csv`
+  - `filtered_2d_timeseries.csv`
+  - `session_meta.json`
+  - 导出范围筛选：仅弓箭 / 仅人体 / 双模型全部
 
 ## 2. 环境准备（uv）
 
@@ -222,3 +241,24 @@ python -m mim train mmpose "D:/work/shejianplus/workspace/demo_project/output/tr
 4. 关键点标签看起来错位
 - 确认当前标签集合 id 连续且与训练目标一致。
 - 建议先“全部图片自动标注”后再人工修正。
+
+## 11. 应用模块使用（推理）
+
+1. 进入“应用模型”页面。
+2. 选择推理目标：
+- `弓箭关键点（RTMO）`
+- `人体关键点（RTMPose-HALPE26）`
+- `双模型（弓箭 + 人体）`
+3. 选择视频文件并开始推理。
+4. 推理结束后如需导出时序数据，请到“导出数据”模块统一导出。
+
+## 12. 导出模块使用（标注导出 + 推理时序导出）
+
+1. 进入“导出数据”页面。
+2. 选择项目目录（包含 `annotations/` 与 `images/`）。
+3. 标注导出：勾选导出项后点击 `开始导出`。
+4. 推理时序导出：
+   - 先在“应用模型”完成一次推理
+   - 回到“导出数据”页面，选择导出范围（仅弓箭/仅人体/双模型全部）
+   - 点击 `导出推理时序CSV`
+5. 输出目录位置：`<project>/output/exports/<时间戳>/`
