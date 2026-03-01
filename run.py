@@ -9,7 +9,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 try:
-    from archery_plus.main import main
+    from shejianplus.main import main
 except ModuleNotFoundError as exc:
     if exc.name and exc.name.startswith("PySide6"):
         print("缺少依赖 PySide6，请先执行: pip install -r requirements.txt")

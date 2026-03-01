@@ -65,7 +65,7 @@ git merge dev
 示例：
 
 ```bash
-python -m py_compile src/archery_plus/ui/pages/inference_page.py
+python -m py_compile src/shejianplus/ui/pages/inference_page.py
 python run.py
 ```
 
@@ -145,8 +145,8 @@ PR 描述建议至少说明：
 
 ```bash
 python -m py_compile run.py
-python -m py_compile src/archery_plus/ui/pages/inference_page.py
-python -m py_compile src/archery_plus/ui/pages/train_page.py
+python -m py_compile src/shejianplus/ui/pages/inference_page.py
+python -m py_compile src/shejianplus/ui/pages/train_page.py
 ```
 
 - 启动检查

@@ -59,11 +59,11 @@
 
 ```powershell
 cd D:\work\shejianplus
-uv venv shejianplus
-.\shejianplus\Scripts\activate
+uv venv .venv
+.\.venv\Scripts\activate
 ```
 
-激活后终端一般会显示：`(shejianplus) PS D:\work\shejianplus>`。
+激活后终端一般会显示：`(.venv) PS D:\work\shejianplus>`。
 
 ### 2.2 安装基础依赖（GUI + ONNX）
 
@@ -233,7 +233,7 @@ python -m mim train mmpose "D:/work/shejianplus/workspace/demo_project/output/tr
 - 处理：确保 `python -c "import mmpose; print(mmpose.__version__)"` 输出 `1.3.2`。
 
 2. `python` 命令找不到
-- 处理：先激活 `shejianplus` 环境，再执行 `python run.py`。
+- 处理：先激活 `.venv` 环境，再执行 `python run.py`。
 
 3. Windows 编码相关报错
 - 当前 GUI 已做子进程兼容处理；若仍出现异常，先重启 GUI 再试。
